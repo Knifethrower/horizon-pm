@@ -13,23 +13,94 @@ Vulkan work for the same devices is in progress and isn't in this repository yet
 
 | Path | What it is |
 |---|---|
-| `patches/` | The series, applied in order to Horizon `26747867d`: 0001, then 0029–0037 and 0041–0055. 0038–0040 are the Vulkan work and aren't here |
+| `patches/` | The series, applied in order to Horizon `26747867d` (see [Building](#building)): 0001, then 0029–0037 and 0041–0055. 0038–0040 are the Vulkan work and aren't here |
 | `FINDINGS.md` | The measurements behind 0029–0037 |
 | `spikes/` | Experiments that didn't make the series |
 | `LICENSE`, `LICENSE.horizon.txt` | This repository's license, and Horizon's |
 
-## Applying
+## Building
+
+The port ships two programs built from this series for `aarch64-unknown-linux-gnu`: `horizon-client` as `mcrust.aarch64`
+and `horizon-prepare` as `horizon-prepare.aarch64`. These steps cross-compile both on an x86-64 Debian or Ubuntu PC
+against a Debian 11 arm64 sysroot, so the results need only glibc 2.30 and run on older firmware too.
+
+### 1. The source
 
 ```bash
 git clone https://github.com/horizon-rust/horizon.git
+git clone https://github.com/Knifethrower/horizon-pm.git
 cd horizon
 git checkout 26747867d
-git am /path/to/horizon-pm/patches/*.patch
+git am ../horizon-pm/patches/*.patch
 ```
 
-Then build `horizon-client` and `horizon-prepare` for `aarch64-unknown-linux-gnu`. The port's first launch prepares the
-game files and bakes compressed textures. A new build needs a new bake, which the port's patcher does when the binary
-changes.
+`git am` needs a git name and email. If you have none set, add `-c user.name=you -c user.email=you@example.com` after `git`.
+
+### 2. The toolchain
+
+- Rust 1.85 or newer (Horizon's `rust-version`) and its Arm target:
+  ```bash
+  rustup target add aarch64-unknown-linux-gnu
+  ```
+- The Arm cross compiler and pkg-config:
+  ```bash
+  sudo apt install gcc-aarch64-linux-gnu g++-aarch64-linux-gnu pkg-config
+  ```
+- A Debian 11 arm64 root to build against (the sysroot), with ALSA's and udev's development files. `debootstrap` makes one:
+  ```bash
+  sudo apt install debootstrap qemu-user-static
+  sudo debootstrap --arch=arm64 --include=libasound2-dev,libudev-dev,libgcc-10-dev bullseye ~/sysroot-bullseye http://deb.debian.org/debian
+  ```
+
+### 3. A linker wrapper
+
+Ubuntu's cross compiler takes libc and its startup files from its own `/usr/aarch64-linux-gnu`, even when given
+`--sysroot`. A program that doesn't happen to pull in another sysroot library, such as `horizon-prepare`, then needs the
+PC's glibc (2.39 on Ubuntu 24.04) instead of Debian 11's. This wrapper points everything at the sysroot:
+
+```bash
+SYSROOT=~/sysroot-bullseye
+mkdir -p ~/xlink
+cat > ~/xlink/aarch64-sysroot-gcc <<EOF
+#!/bin/sh
+exec aarch64-linux-gnu-gcc --sysroot=$SYSROOT -B$SYSROOT/usr/lib/aarch64-linux-gnu -L$SYSROOT/usr/lib/aarch64-linux-gnu \
+  -L$SYSROOT/lib/aarch64-linux-gnu -L$SYSROOT/usr/lib/gcc/aarch64-linux-gnu/10 "\$@"
+EOF
+chmod +x ~/xlink/aarch64-sysroot-gcc
+```
+
+### 4. Build
+
+From the `horizon` folder, in the same shell:
+
+```bash
+export PKG_CONFIG_ALLOW_CROSS=1 PKG_CONFIG_SYSROOT_DIR=$SYSROOT
+export PKG_CONFIG_LIBDIR=$SYSROOT/usr/lib/aarch64-linux-gnu/pkgconfig:$SYSROOT/usr/share/pkgconfig
+export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=$HOME/xlink/aarch64-sysroot-gcc
+export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
+export CFLAGS_aarch64_unknown_linux_gnu=--sysroot=$SYSROOT CXXFLAGS_aarch64_unknown_linux_gnu=--sysroot=$SYSROOT
+cargo build --release --target aarch64-unknown-linux-gnu -p horizon-client --bin horizon-client
+cargo build --release --target aarch64-unknown-linux-gnu -p horizon-prepare
+```
+
+`release` is thin LTO with one codegen unit, as the port ships. For quicker test builds, `--profile fast` skips LTO, and
+its output goes to `target/aarch64-unknown-linux-gnu/fast/` instead.
+
+### 5. Into the port
+
+```bash
+T=target/aarch64-unknown-linux-gnu/release
+aarch64-linux-gnu-strip -o mcrust.aarch64 $T/horizon-client
+aarch64-linux-gnu-strip -o horizon-prepare.aarch64 $T/horizon-prepare
+readelf -V mcrust.aarch64 horizon-prepare.aarch64 | grep -oE 'GLIBC_[0-9.]+' | sort -Vu | tail -1
+```
+
+The last command prints the newest glibc either program needs, GLIBC_2.30 with these steps. `min_glibc` in the port's
+`port.json` must be at least that. Copy both files into the port's `mcrust/` folder. The next launch bakes the textures
+again, because the patcher keys its bake on the game binary.
+
+On an arm64 Linux machine you can skip steps 2 to 4: install `libasound2-dev`, `libudev-dev` and Rust, then run the two
+`cargo build --release -p ...` commands without `--target`. The programs then need that machine's glibc.
 
 ## What they do
 
