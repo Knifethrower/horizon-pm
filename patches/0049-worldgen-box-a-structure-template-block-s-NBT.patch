@@ -1,0 +1,160 @@
+From 71716dcf385de30e59c26ea3140540e6a914f018 Mon Sep 17 00:00:00 2001
+From: Knifethrower <andersenpeters@gmail.com>
+Date: Fri, 6 Nov 2026 16:24:23 -0500
+Subject: [PATCH 49/54] worldgen: box a structure template block's NBT
+
+Hypothesis: every block of every loaded template pays 24 bytes for an NBT compound nearly none of them have,
+and templates stay loaded for the session: 22.6 MiB after three teleports, growing with exploration.
+
+Change: Option<Box<Compound>>, 8 bytes, so a BlockInfo goes from 40 bytes to 24.
+
+Number: from_nbt's live memory after three teleports on an R36S, 22.6 MiB to 13.0 MiB.
+
+Falsifier: structures place differently.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/game/structure_blocks.rs              |  2 +-
+ .../src/worldgen/structure/processor.rs       | 22 ++++++++++++-------
+ .../src/worldgen/structure/template.rs        |  9 ++++----
+ 3 files changed, 20 insertions(+), 13 deletions(-)
+
+diff --git a/crates/horizon-client/src/game/structure_blocks.rs b/crates/horizon-client/src/game/structure_blocks.rs
+index 6825147..c1e5f0c 100644
+--- a/crates/horizon-client/src/game/structure_blocks.rs
++++ b/crates/horizon-client/src/game/structure_blocks.rs
+@@ -223,7 +223,7 @@ impl Game<'_> {
+                     blocks.push(BlockInfo {
+                         pos: [x, y, z],
+                         state,
+-                        nbt,
++                        nbt: nbt.map(Box::new),
+                     });
+                 }
+             }
+diff --git a/crates/horizon-world/src/worldgen/structure/processor.rs b/crates/horizon-world/src/worldgen/structure/processor.rs
+index 141ff91..b993a8d 100644
+--- a/crates/horizon-world/src/worldgen/structure/processor.rs
++++ b/crates/horizon-world/src/worldgen/structure/processor.rs
+@@ -501,7 +501,7 @@ impl Pick {
+             [one] => *one,
+             many => many[random.int(many.len() as i32) as usize],
+         };
+-        let mut nbt = outcome.nbt.clone().or(info.nbt);
++        let mut nbt = outcome.nbt.clone().map(Box::new).or(info.nbt);
+         for list in &outcome.lists {
+             let values = (0..list.count)
+                 .map(|_| {
+@@ -514,7 +514,7 @@ impl Pick {
+                     Tag::String(v.as_str().into())
+                 })
+                 .collect();
+-            nbt.get_or_insert_with(Compound::new)
++            nbt.get_or_insert_with(Default::default)
+                 .insert(list.key.as_str().into(), Tag::List(values));
+         }
+         BlockInfo {
+@@ -1143,7 +1143,10 @@ fn process_block<W: PlacementContext>(
+                 return Ok(Some(BlockInfo {
+                     pos: info.pos,
+                     state: rule.output,
+-                    nbt: rule.modifier.apply(info.nbt.as_ref(), &mut random),
++                    nbt: rule
++                        .modifier
++                        .apply(info.nbt.as_deref(), &mut random)
++                        .map(Box::new),
+                 }));
+             }
+             Some(info)
+@@ -1209,7 +1212,10 @@ fn process_block<W: PlacementContext>(
+                     .unwrap_or(state),
+                 false => state,
+             };
+-            let nbt = set.modifier.apply(info.nbt.as_ref(), &mut random);
++            let nbt = set
++                .modifier
++                .apply(info.nbt.as_deref(), &mut random)
++                .map(Box::new);
+             Some(BlockInfo { state, nbt, ..info })
+         }
+         Processor::Condition(c) => {
+@@ -1271,7 +1277,7 @@ fn process_block<W: PlacementContext>(
+             let entity = spawner.pick(|| settings.with_random(pos, |r| r.float()));
+             Some(match entity {
+                 Some(entity) => BlockInfo {
+-                    nbt: Some(spawner.nbt(entity)),
++                    nbt: Some(Box::new(spawner.nbt(entity))),
+                     ..info
+                 },
+                 None => BlockInfo {
+@@ -1542,7 +1548,7 @@ pub fn place_in_world<W: FeatureWorld + PlacementContext>(
+                 };
+                 nbt.insert("LootTableSeed".into(), Tag::Long(seed));
+             }
+-            world.set_block_entity(info.pos, nbt)?;
++            world.set_block_entity(info.pos, *nbt)?;
+         }
+         if let Some(previous) = previous {
+             if resources.source_fluid(state) {
+@@ -2057,7 +2063,7 @@ mod tests {
+         let glass = || BlockInfo {
+             pos: [1, 2, 3],
+             state: BlockStateId(0),
+-            nbt: Some(Compound::new()),
++            nbt: Some(Box::default()),
+         };
+         let run = |f: f32, i: Vec<i32>| pick.apply(glass(), &mut Draws(vec![f], i));
+         let sus = run(0.005, vec![]);
+@@ -2068,7 +2074,7 @@ mod tests {
+                 .contains_key(&JavaString::from("LootTable"))
+         );
+         assert_eq!(run(0.01, vec![]).state, BlockStateId(1));
+-        assert_eq!(run(0.2999, vec![]).nbt, Some(Compound::new()));
++        assert_eq!(run(0.2999, vec![]).nbt, Some(Box::default()));
+         assert_eq!(run(0.3, vec![]).state, BlockStateId(2));
+         // The stairs' facing: Plane.HORIZONTAL[nextInt(4)] after the pick.
+         assert_eq!(run(0.75, vec![2]).state, BlockStateId(12));
+diff --git a/crates/horizon-world/src/worldgen/structure/template.rs b/crates/horizon-world/src/worldgen/structure/template.rs
+index 51a4944..ea47ea6 100644
+--- a/crates/horizon-world/src/worldgen/structure/template.rs
++++ b/crates/horizon-world/src/worldgen/structure/template.rs
+@@ -11,7 +11,8 @@ use std::sync::{Arc, OnceLock};
+ pub struct BlockInfo {
+     pub pos: [i32; 3],
+     pub state: BlockStateId,
+-    pub nbt: Option<Compound>,
++    /// Boxed: nearly no block has any, and a template holds thousands of these for the session.
++    pub nbt: Option<Box<Compound>>,
+ }
+ #[derive(Clone, Debug)]
+ pub struct JigsawInfo {
+@@ -172,7 +173,7 @@ pub fn save_nbt(
+         tag.insert("pos".into(), int_list(block.pos));
+         tag.insert("state".into(), Tag::Int(index as i32));
+         if let Some(nbt) = &block.nbt {
+-            tag.insert("nbt".into(), Tag::Compound(nbt.clone()));
++            tag.insert("nbt".into(), Tag::Compound((**nbt).clone()));
+         }
+         block_list.push(Tag::Compound(tag));
+     }
+@@ -260,7 +261,7 @@ impl StructureTemplate {
+                     .copied()
+                     .unwrap_or(air);
+                 let nbt = match get(block, "nbt") {
+-                    Some(Tag::Compound(c)) => Some(c.clone()),
++                    Some(Tag::Compound(c)) => Some(Box::new(c.clone())),
+                     _ => None,
+                 };
+                 let class = if nbt.is_some() {
+@@ -504,7 +505,7 @@ mod save_tests {
+             nbt: nbt.then(|| {
+                 let mut c = Compound::new();
+                 c.insert("id".into(), Tag::String("minecraft:chest".into()));
+-                c
++                Box::new(c)
+             }),
+         };
+         let blocks = vec![
+-- 
+2.43.0
+

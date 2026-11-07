@@ -1,0 +1,102 @@
+diff --git a/crates/horizon-client-render/src/gfx.rs b/crates/horizon-client-render/src/gfx.rs
+index 3bafc37..6e48ccc 100644
+--- a/crates/horizon-client-render/src/gfx.rs
++++ b/crates/horizon-client-render/src/gfx.rs
+@@ -608,6 +608,7 @@ pub struct Renderer {
+     /// fog: `plain_terrain`.
+     plain_opaque: wgpu::RenderPipeline,
+     plain_rest: wgpu::RenderPipeline,
++    plain_depth: wgpu::RenderPipeline,
+     translucent: wgpu::RenderPipeline,
+     /// Flat section draws (`flat`), where multi-draw is emulated.
+     flat: Option<flat::Flat>,
+@@ -1977,6 +1978,44 @@ impl Renderer {
+             true,
+             None,
+         );
++        let plain_depth = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
++            label: Some("Terrain depth pre-pass"),
++            layout: Some(&layout),
++            vertex: wgpu::VertexState {
++                module: &shader,
++                entry_point: Some("vs_terrain_depth"),
++                compilation_options: Default::default(),
++                buffers: &terrain_buffers,
++            },
++            primitive: wgpu::PrimitiveState {
++                topology: tri,
++                cull_mode: Some(wgpu::Face::Back),
++                ..Default::default()
++            },
++            depth_stencil: Some(wgpu::DepthStencilState {
++                format: wgpu::TextureFormat::Depth32Float,
++                depth_write_enabled: Some(true),
++                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
++                stencil: Default::default(),
++                bias: Default::default(),
++            }),
++            multisample: Default::default(),
++            fragment: Some(wgpu::FragmentState {
++                module: &shader,
++                entry_point: Some("fs_depth_only"),
++                compilation_options: wgpu::PipelineCompilationOptions {
++                    constants: &sprite_constants,
++                    ..Default::default()
++                },
++                targets: &[Some(wgpu::ColorTargetState {
++                    format: config.format.remove_srgb_suffix(),
++                    blend: None,
++                    write_mask: wgpu::ColorWrites::empty(),
++                })],
++            }),
++            multiview_mask: None,
++            cache: None,
++        });
+         let plain_rest = pipeline(
+             "Terrain solid, plain",
+             "vs_terrain_plain",
+@@ -3587,6 +3626,7 @@ impl Renderer {
+             solid_opaque,
+             plain_opaque,
+             plain_rest,
++            plain_depth,
+             solid_mirror,
+             mirror_globals,
+             mirror_group,
+@@ -6786,6 +6826,10 @@ impl Renderer {
+                                 && frame.dynamic_lights.is_empty()
+                                 && frame.colored_lights.is_empty()
+                                 && frame.emissive_layers.is_empty();
++                            if plain_terrain && std::env::var_os("HZ_EXP_PREPASS").is_some() {
++                                pass.set_pipeline(&self.plain_depth);
++                                self.draw_sections(&mut pass, &self.indirect, 0, 0, opaque_draws);
++                            }
+                             pass.set_pipeline(if plain_terrain {
+                                 &self.plain_opaque
+                             } else {
+diff --git a/crates/horizon-client-render/src/terrain.wgsl b/crates/horizon-client-render/src/terrain.wgsl
+index 2a4e26f..46ce669 100644
+--- a/crates/horizon-client-render/src/terrain.wgsl
++++ b/crates/horizon-client-render/src/terrain.wgsl
+@@ -366,7 +366,7 @@ fn brightness(c: vec3<f32>) -> f32 {
+ // tiles. The same picture from far less work: a vertex writes 9 values instead of 17, and a pixel
+ // neither looks its layer up (the vertex did) nor divides for its fog.
+ struct PlainOut {
+-    @builtin(position) clip: vec4<f32>,
++    @invariant @builtin(position) clip: vec4<f32>,
+     @location(0) uv: vec2<f32>,
+     // The layer in `animated` with `PLAIN_ANIMATED` set, or else in the sprite arrays.
+     @location(1) @interpolate(flat) layer: u32,
+@@ -394,6 +394,12 @@ fn fog_fraction(d: f32, start: f32, end: f32) -> f32 {
+         fog_fraction(max(length(pos.xz), abs(pos.y)), globals.fog.z, globals.fog.w));
+     return out;
+ }
++// The opaque faces' depth alone, before they are drawn: `vs_terrain_plain` then shades only what shows.
++@vertex fn vs_terrain_depth(@location(0) position: vec3<f32>,
++    @location(5) origin: vec4<f32>) -> @invariant @builtin(position) vec4<f32> {
++    return globals.view_proj * vec4(position + origin.xyz, 1.0);
++}
++@fragment fn fs_depth_only() {}
+ fn plain_texel(in: PlainOut) -> vec4<f32> {
+     let du = dpdx(in.uv);
+     let dv = dpdy(in.uv);

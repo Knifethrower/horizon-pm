@@ -1,0 +1,70 @@
+From 5e49f9ce529919f4a0543509e85f88c7e03fa1da Mon Sep 17 00:00:00 2001
+From: Knifethrower <andersenpeters@gmail.com>
+Date: Fri, 6 Nov 2026 16:24:23 -0500
+Subject: [PATCH 45/54] world: share the face tables between the meshing
+ workers
+
+Hypothesis: each meshing worker clones FaceVisibility for its own occlusion cache, and the clone copies
+every state and face shape, about 3.6 MiB for each of three workers.
+
+Change: the states and faces are immutable, so the clones share them. Each worker keeps its own cache.
+
+Number: on an R36S the streaming threads' own live memory, mostly these clones, went from 14.6 MiB to under
+2 MiB.
+
+Falsifier: FaceVisibility's tests fail, or faces show that shouldn't.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/horizon-world/src/block_render.rs | 14 ++++++++------
+ 1 file changed, 8 insertions(+), 6 deletions(-)
+
+diff --git a/crates/horizon-world/src/block_render.rs b/crates/horizon-world/src/block_render.rs
+index 51ea6be..0f0bdec 100644
+--- a/crates/horizon-world/src/block_render.rs
++++ b/crates/horizon-world/src/block_render.rs
+@@ -11,6 +11,7 @@ use horizon_core::geometry::{Direction, ShapeOp, VoxelShape};
+ use std::{
+     collections::{BTreeMap, HashMap},
+     io,
++    sync::Arc,
+ };
+ 
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+@@ -41,8 +42,9 @@ struct State {
+ /// is deduplicated by the imported immutable shape, not copied for every state.
+ #[derive(Clone)]
+ pub struct FaceVisibility {
+-    states: Vec<State>,
+-    faces: Vec<VoxelShape>,
++    /// Shared by the clones: each meshing worker has its own `cache`, and these never change.
++    states: Arc<[State]>,
++    faces: Arc<[VoxelShape]>,
+     cache: HashMap<(u32, u32), bool>,
+ }
+ impl FaceVisibility {
+@@ -50,8 +52,8 @@ impl FaceVisibility {
+     /// answers "unknown render state".
+     pub fn empty() -> Self {
+         Self {
+-            states: Vec::new(),
+-            faces: vec![VoxelShape::empty(), VoxelShape::block()],
++            states: Arc::from([]),
++            faces: Arc::from([VoxelShape::empty(), VoxelShape::block()]),
+             cache: HashMap::new(),
+         }
+     }
+@@ -140,8 +142,8 @@ impl FaceVisibility {
+             });
+         }
+         Ok(Self {
+-            states,
+-            faces,
++            states: states.into(),
++            faces: faces.into(),
+             cache: HashMap::new(),
+         })
+     }
+-- 
+2.43.0
+

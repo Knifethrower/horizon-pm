@@ -1,0 +1,51 @@
+From 86365dbdaebe4499c41c9374d9eae2304459c9c2 Mon Sep 17 00:00:00 2001
+From: Knifethrower <andersenpeters@gmail.com>
+Date: Fri, 6 Nov 2026 16:24:23 -0500
+Subject: [PATCH 44/54] audio: halve the sound cache's share of the RAM
+
+Hypothesis: 0030's sound cache, a 32nd of the RAM, is one of the largest things that grows after a world
+opens: new biomes and mobs fill it, and a teleport fills it at once.
+
+Change: a 64th of the RAM (13 MiB on 895 MiB). Past that a sound decodes again when it next plays.
+
+Number: audio::decode's live memory on an R36S held to 1 GB: 23.2 MiB to 14.8 MiB after three teleports.
+
+Falsifier: repeated decoding shows up as frame hitches while sounds play.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/horizon-client-render/src/audio.rs | 10 +++++-----
+ 1 file changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/crates/horizon-client-render/src/audio.rs b/crates/horizon-client-render/src/audio.rs
+index b6f58be..79574a8 100644
+--- a/crates/horizon-client-render/src/audio.rs
++++ b/crates/horizon-client-render/src/audio.rs
+@@ -188,9 +188,9 @@ impl Default for SoundCache {
+ /// The most the sound cache keeps, on a machine with RAM to spare.
+ const CACHE_BYTES: usize = 64 << 20;
+ /// The cache's share of the machine's RAM where [`CACHE_BYTES`] is more.
+-const CACHE_RAM_SHARE: u64 = 32;
++const CACHE_RAM_SHARE: u64 = 64;
+ /// The sound cache's budget on this device: [`CACHE_BYTES`], or a
+-/// thirty-second of the machine's RAM when that is smaller. Every static sound
++/// sixty-fourth of the machine's RAM when that is smaller. Every static sound
+ /// of a session decodes to 1.4 GiB of `f32`, so the cache fills to whatever it
+ /// is given and stays there, beside a game that has no swap to fall back on on
+ /// a 1 GB handheld. Past the budget a sound is decoded again the next time it
+@@ -1737,9 +1737,9 @@ mod tests {
+         const GIB: u64 = 1 << 30;
+         assert_eq!(budget_for(None), CACHE_BYTES);
+         assert_eq!(budget_for(Some(16 * GIB)), CACHE_BYTES);
+-        assert_eq!(budget_for(Some(2 * GIB)), CACHE_BYTES);
+-        assert_eq!(budget_for(Some(GIB)), 32 << 20);
+-        assert_eq!(budget_for(Some(GIB / 2)), 16 << 20);
++        assert_eq!(budget_for(Some(4 * GIB)), CACHE_BYTES);
++        assert_eq!(budget_for(Some(GIB)), 16 << 20);
++        assert_eq!(budget_for(Some(GIB / 2)), 8 << 20);
+     }
+     /// A streamed sound plays sample for sample as the same sound decoded
+     /// whole, and its decoder never runs more than a packet past `ahead`.
+-- 
+2.43.0
+

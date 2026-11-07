@@ -1,0 +1,51 @@
+From cd1e1007a5b26ff862fff74d8da09cfab44eb9a8 Mon Sep 17 00:00:00 2001
+From: Knifethrower <andersenpeters@gmail.com>
+Date: Fri, 6 Nov 2026 11:14:25 -0500
+Subject: [PATCH 42/54] render: keep the animated sprite array an array on
+ OpenGL
+
+Hypothesis: water, lava, fire and kelp are black because the animated array has 54 layers, a
+multiple of six, so wgpu's GL backend creates it as a cube map array. A sampler2DArray reads
+that as an incomplete texture: opaque black. Black whether or not the animator runs.
+
+Change: pad its layer count with array_layers(), as the sprite arrays already are.
+
+Number: on an R36S with Mali-G31 GL, the same scene went from black to textured. One extra
+layer of a 64 px chain, 22 KiB.
+
+Falsifier: water stays black with this applied, or animatedTextures:false changes the result.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/horizon-client-render/src/gfx.rs | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/crates/horizon-client-render/src/gfx.rs b/crates/horizon-client-render/src/gfx.rs
+index 311f164..020b163 100644
+--- a/crates/horizon-client-render/src/gfx.rs
++++ b/crates/horizon-client-render/src/gfx.rs
+@@ -2296,7 +2296,11 @@ impl Renderer {
+                 (edge * edge * 4) as usize
+             })
+             .sum();
+-        let mut animated_data = vec![0u8; chain * animated_count as usize];
++        // Padded like every array here: the count comes from the pack, and at a multiple of six
++        // OpenGL makes this a cube map array, which the shaders' 2D array sampler reads as opaque
++        // black. Vanilla's 54 layers are one.
++        let animated_texture_layers = array_layers(animated_count, gl);
++        let mut animated_data = vec![0u8; chain * animated_texture_layers as usize];
+         for (dense, pixels) in animated_pixels.iter().enumerate() {
+             if let Some(pixels) = pixels {
+                 let start = dense * chain;
+@@ -2311,7 +2315,7 @@ impl Renderer {
+                 size: wgpu::Extent3d {
+                     width: sprite_size,
+                     height: sprite_size,
+-                    depth_or_array_layers: animated_count,
++                    depth_or_array_layers: animated_texture_layers,
+                 },
+                 mip_level_count: sprite_levels,
+                 sample_count: 1,
+-- 
+2.43.0
+

@@ -1,0 +1,2 @@
+# Keep every byte: the patch files must apply exactly, whatever the machine.
+* -text

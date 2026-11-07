@@ -1,0 +1,77 @@
+From 5f7f6d7b39dea315389633cb1804c14f5fb7ec67 Mon Sep 17 00:00:00 2001
+From: Knifethrower <andersenpeters@gmail.com>
+Date: Fri, 6 Nov 2026 16:24:23 -0500
+Subject: [PATCH 50/54] chat: don't keep the parsed command registries on a
+ small machine
+
+Hypothesis: command-registries.json stays parsed in a static for the session so the next world opens 15 ms
+sooner: 4.5 MiB as a JSON tree, read only while a world opens.
+
+Change: kept only where three times the file is at most a 256th of the RAM. Elsewhere it's read again.
+
+Number: horizon_client::game::chat::command_export, 4.5 MiB live on an R36S held to 1 GB.
+
+Falsifier: world opening gets noticeably slower.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/horizon-client/src/game/chat.rs | 31 +++++++++++++++++++++++---
+ 1 file changed, 28 insertions(+), 3 deletions(-)
+
+diff --git a/crates/horizon-client/src/game/chat.rs b/crates/horizon-client/src/game/chat.rs
+index 0dbb85e..740a180 100644
+--- a/crates/horizon-client/src/game/chat.rs
++++ b/crates/horizon-client/src/game/chat.rs
+@@ -261,14 +261,31 @@ fn command_export(dir: &Path) -> Option<Arc<serde_json::Value>> {
+     if let Some((_, export)) = cache.iter().find(|(cached, _)| cached == dir) {
+         return export.clone();
+     }
+-    let export = std::fs::read(dir.join("command-registries.json"))
+-        .ok()
++    let bytes = std::fs::read(dir.join("command-registries.json")).ok();
++    let size = bytes.as_ref().map_or(0, Vec::len) as u64;
++    let export = bytes
+         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+         .map(Arc::new);
+-    cache.push((dir.to_owned(), export.clone()));
++    let total = std::fs::read_to_string("/proc/meminfo").ok().and_then(|t| {
++        t.lines().find_map(|line| {
++                let rest = line.strip_prefix("MemTotal:")?;
++                let kib: u64 = rest.split_whitespace().next()?.parse().ok()?;
++                Some(kib * 1024)
++            })
++        });
++    if export_worth_keeping(size, total) {
++        cache.push((dir.to_owned(), export.clone()));
++    }
+     export
+ }
+ 
++/// Whether a parsed export stays in memory for the next world. Parsed, it takes about three times
++/// its file; not worth it where that's more than a 256th of the RAM: reading it again costs
++/// a fraction of a second at a world's opening.
++fn export_worth_keeping(file_bytes: u64, total_ram: Option<u64>) -> bool {
++    total_ram.is_none_or(|ram| file_bytes * 3 <= ram / 256)
++}
++
+ /// The `minecraft:` ids of the `extension` files under `root`, sorted.
+ fn ids_under(root: &Path, extension: &str) -> Vec<String> {
+     ids_in(root, extension, "minecraft")
+@@ -1540,6 +1557,14 @@ mod tests {
+         let _ = std::fs::remove_dir_all(&root);
+     }
+ 
++    #[test]
++    fn a_large_export_is_not_kept_on_a_small_machine() {
++        const GIB: u64 = 1 << 30;
++        assert!(export_worth_keeping(1_600_000, None));
++        assert!(export_worth_keeping(1_600_000, Some(8 * GIB)));
++        assert!(!export_worth_keeping(1_600_000, Some(GIB)));
++    }
++
+     /// The export is read once per folder; a folder without one stays without.
+     #[test]
+     fn command_exports_are_read_once_per_folder() {
+-- 
+2.43.0
+

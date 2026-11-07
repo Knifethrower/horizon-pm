@@ -1,0 +1,385 @@
+diff --git a/crates/horizon-client-render/src/gfx.rs b/crates/horizon-client-render/src/gfx.rs
+index 3bafc37..42e31d8 100644
+--- a/crates/horizon-client-render/src/gfx.rs
++++ b/crates/horizon-client-render/src/gfx.rs
+@@ -6029,7 +6029,11 @@ impl Renderer {
+             camera,
+         );
+         let all_entities = &self.entity_batch.combined;
+-        let hand_quads = (frame.hand.len() / 4) as u32;
++        let hand_quads = if std::env::var_os("HZ_EXP_NO_HAND").is_some() {
++            0
++        } else {
++            (frame.hand.len() / 4) as u32
++        };
+         let additive_quads = (frame.additive.len() / 4) as u32 - self.entity_batch.moved_additive;
+         let see_through_quads = (frame.see_through.len() / 4) as u32;
+         let entity_vertices = all_entities.len() as u64;
+@@ -7548,7 +7552,7 @@ impl Renderer {
+             &self.depth,
+             frame.hud,
+             [self.config.width, self.config.height],
+-            0..blur_at,
++            if std::env::var_os("HZ_EXP_NO_HUD").is_some() { 0..0 } else { 0..blur_at },
+         );
+         if let Some(radius) = menu_blur {
+             let format = self.config.format;
+@@ -7571,7 +7575,11 @@ impl Renderer {
+             &self.depth,
+             frame.hud,
+             [self.config.width, self.config.height],
+-            blur_at..frame.hud.vertices.len() as u32,
++            if std::env::var_os("HZ_EXP_NO_HUD").is_some() {
++                0..0
++            } else {
++                blur_at..frame.hud.vertices.len() as u32
++            },
+         );
+         if culling && let Some(cull) = &mut self.cull {
+             cull.end(&self.device, &mut encoder);
+@@ -7616,6 +7624,18 @@ impl Renderer {
+             startup_step(format_args!("submitting the first frame"));
+             self.first_frame = FirstFrame::Drawn;
+         }
++        if std::env::var_os("HZ_EXP_LOG_DRAWS").is_some() {
++            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 100 == 0 {
++                log::info!(
++                    "hzexp draws {} sections {} hud runs {} hand {}",
++                    self.draws.len(),
++                    visible.len(),
++                    frame.hud.vertices.len(),
++                    frame.hand.len()
++                );
++            }
++        }
+         let submission = crate::spans::time("submit", || self.queue.submit([commands]));
+         if let Some(cull) = &mut self.cull {
+             cull.submitted();
+@@ -8081,6 +8101,12 @@ fn facing_group_from(
+     origin: [f32; 3],
+     mut draw: impl FnMut(u32, u32),
+ ) {
++    static NO_SIDES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    let eye = if *NO_SIDES.get_or_init(|| std::env::var_os("HZ_EXP_NO_SIDES").is_some()) {
++        None
++    } else {
++        eye
++    };
+     match eye {
+         Some(eye) => {
+             let eye = eye - Vec3::from(origin);
+diff --git a/third_party/wgpu-hal/src/gles/command.rs b/third_party/wgpu-hal/src/gles/command.rs
+index 8434095..b4ab06f 100644
+--- a/third_party/wgpu-hal/src/gles/command.rs
++++ b/third_party/wgpu-hal/src/gles/command.rs
+@@ -259,6 +259,41 @@ impl super::CommandEncoder {
+     }
+ }
+ 
++/// What `queue::PassRun` is told of a render pass, `None` if no other pass can continue it.
++fn pass_targets(
++    desc: &crate::RenderPassDescriptor<super::QuerySet, super::TextureView>,
++) -> Option<super::PassTargets> {
++    let [Some(color)] = desc.color_attachments else {
++        return None;
++    };
++    if desc.sample_count != 1
++        || desc.timestamp_writes.is_some()
++        || desc.occlusion_query_set.is_some()
++        || color.resolve_target.is_some()
++        || color.depth_slice.is_some()
++        || !color.ops.contains(crate::AttachmentOps::STORE)
++        || !matches!(
++            color.target.view.inner,
++            super::TextureInner::Renderbuffer { .. } | super::TextureInner::Texture { .. }
++        )
++    {
++        return None;
++    }
++    let depth = match &desc.depth_stencil_attachment {
++        Some(depth) if depth.target.view.aspects == crate::FormatAspects::DEPTH => Some((
++            depth.target.view.clone(),
++            depth.depth_ops.contains(crate::AttachmentOps::STORE_DISCARD),
++        )),
++        Some(_) => return None,
++        None => None,
++    };
++    Some(super::PassTargets {
++        color: color.target.view.clone(),
++        clears_color: color.ops.contains(crate::AttachmentOps::LOAD_CLEAR),
++        depth,
++    })
++}
++
+ impl crate::CommandEncoder for super::CommandEncoder {
+     type A = super::Api;
+ 
+@@ -512,6 +547,9 @@ impl crate::CommandEncoder for super::CommandEncoder {
+         self.state.render_size = desc.extent;
+         self.state.resolve_attachments.clear();
+         self.state.invalidate_attachments.clear();
++        self.cmd_buffer
++            .commands
++            .push(C::PassTargets(pass_targets(desc).map(alloc::boxed::Box::new)));
+         if let Some(label) = desc.label {
+             let range = self.cmd_buffer.add_marker(label);
+             self.cmd_buffer.commands.push(C::PushDebugGroup(range));
+@@ -710,6 +748,7 @@ impl crate::CommandEncoder for super::CommandEncoder {
+             ));
+             self.state.invalidate_attachments.clear();
+         }
++        self.cmd_buffer.commands.push(C::PassEnd);
+         if self.state.has_pass_label {
+             self.cmd_buffer.commands.push(C::PopDebugGroup);
+             self.state.has_pass_label = false;
+diff --git a/third_party/wgpu-hal/src/gles/mod.rs b/third_party/wgpu-hal/src/gles/mod.rs
+index 6c9e282..dad056c 100644
+--- a/third_party/wgpu-hal/src/gles/mod.rs
++++ b/third_party/wgpu-hal/src/gles/mod.rs
+@@ -898,8 +898,24 @@ struct PrimitiveState {
+ 
+ type InvalidatedAttachments = ArrayVec<u32, { crate::MAX_COLOR_ATTACHMENTS + 2 }>;
+ 
++/// The attachments of a render pass with a single color attachment, none of it resolved or
++/// multisampled and no queries around it: what `queue::PassRun` needs to let a following pass
++/// continue it.
++#[derive(Clone, Debug)]
++struct PassTargets {
++    color: TextureView,
++    /// Whether the pass clears the color attachment.
++    clears_color: bool,
++    /// Its depth attachment, and whether the pass discards the contents.
++    depth: Option<(TextureView, bool)>,
++}
++
+ #[derive(Debug)]
+ enum Command {
++    /// A render pass begins. `None`: one no other pass can continue.
++    PassTargets(Option<alloc::boxed::Box<PassTargets>>),
++    /// The render pass has ended.
++    PassEnd,
+     Draw {
+         topology: u32,
+         first_vertex: u32,
+diff --git a/third_party/wgpu-hal/src/gles/queue.rs b/third_party/wgpu-hal/src/gles/queue.rs
+index 24f2cfb..33586fc 100644
+--- a/third_party/wgpu-hal/src/gles/queue.rs
++++ b/third_party/wgpu-hal/src/gles/queue.rs
+@@ -85,9 +85,11 @@ impl super::Queue {
+         }
+     }
+ 
+-    unsafe fn reset_state(&self, gl: &glow::Context) {
++    unsafe fn reset_state(&self, gl: &glow::Context, keep_framebuffer: bool) {
+         unsafe { gl.use_program(None) };
+-        unsafe { gl.bind_framebuffer(glow::FRAMEBUFFER, None) };
++        if !keep_framebuffer {
++            unsafe { gl.bind_framebuffer(glow::FRAMEBUFFER, None) };
++        }
+         unsafe { gl.disable(glow::DEPTH_TEST) };
+         unsafe { gl.disable(glow::STENCIL_TEST) };
+         unsafe { gl.disable(glow::SCISSOR_TEST) };
+@@ -1114,6 +1116,7 @@ impl super::Queue {
+                     }
+                 }
+             }
++            C::PassTargets(_) | C::PassEnd => {}
+             C::ResetFramebuffer { is_default } => {
+                 if is_default {
+                     unsafe { gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, None) };
+@@ -1907,6 +1910,109 @@ impl super::Queue {
+     }
+ }
+ 
++/// Consecutive render passes onto one target, replayed as one GL frame. Each pass takes the
++/// framebuffer apart and puts it together again, and each of wgpu-core's command buffers unbinds
++/// it: on a tile-based GPU that ends the frame, so the whole target is written out and read back
++/// for the next pass, and the driver sets up a frame for each. A pass that loads what the one
++/// before stored needs none of that as long as nothing in between touches the framebuffer.
++#[derive(Default)]
++struct PassRun {
++    /// The pass being replayed, if a following one could continue it.
++    current: Option<alloc::boxed::Box<super::PassTargets>>,
++    /// The pass that has just ended, while nothing else has been replayed since.
++    ended: Option<alloc::boxed::Box<super::PassTargets>>,
++    /// What the passes so far discard, for when the run ends.
++    discard: alloc::vec::Vec<u32>,
++    /// The attachments of a pass that continues the run are in place already.
++    skipping: bool,
++}
++
++fn same_target(a: &super::TextureView, b: &super::TextureView) -> bool {
++    let same = match (&a.inner, &b.inner) {
++        (
++            super::TextureInner::Renderbuffer { raw: a },
++            super::TextureInner::Renderbuffer { raw: b },
++        ) => a == b,
++        (
++            super::TextureInner::Texture { raw: a, target: t },
++            super::TextureInner::Texture { raw: b, target: u },
++        ) => a == b && t == u,
++        _ => false,
++    };
++    same && a.mip_levels == b.mip_levels && a.array_layers == b.array_layers
++}
++
++impl super::PassTargets {
++    /// Whether a pass on `next` can go on where this one left off. Without a depth attachment of
++    /// its own it finds this one's still attached, with the depth test off by its pipelines, so
++    /// that one must be going unread.
++    fn continues_into(&self, next: &Self) -> bool {
++        !next.clears_color
++            && same_target(&self.color, &next.color)
++            && match (&self.depth, &next.depth) {
++                (None, None) => true,
++                (Some((_, discarded)), None) => *discarded,
++                (Some((a, _)), Some((b, _))) => same_target(a, b),
++                (None, Some(_)) => false,
++            }
++    }
++}
++
++impl PassRun {
++    /// Before `command` is replayed: whether it is to be left out.
++    unsafe fn before(&mut self, gl: &glow::Context, can_invalidate: bool, command: &C) -> bool {
++        match command {
++            C::PassTargets(next) => {
++                let continues = match (&self.ended, next) {
++                    (Some(last), Some(next)) => {
++                        last.continues_into(next) && std::env::var_os("HZ_EXP_NO_MERGE").is_none()
++                    }
++                    _ => false,
++                };
++                if continues {
++                    // Its depth is this pass's now, to discard or not at its end.
++                    if next.as_ref().is_some_and(|next| next.depth.is_some()) {
++                        self.discard.clear();
++                    }
++                } else {
++                    unsafe { self.flush(gl, can_invalidate) };
++                }
++                self.ended = None;
++                self.current.clone_from(next);
++                self.skipping = continues;
++                true
++            }
++            C::PassEnd => {
++                self.ended = self.current.take();
++                true
++            }
++            C::ResetFramebuffer { .. } | C::BindAttachment { .. } => self.skipping,
++            C::SetDrawColorBuffers(_) => core::mem::take(&mut self.skipping),
++            C::InvalidateAttachments(list) if self.current.is_some() => {
++                self.discard.extend_from_slice(list);
++                true
++            }
++            C::PushDebugGroup(_)
++            | C::PopDebugGroup
++            | C::InsertDebugMarker(_)
++            | C::UnsetVertexAttribute(_) => false,
++            _ => {
++                if self.ended.take().is_some() {
++                    unsafe { self.flush(gl, can_invalidate) };
++                }
++                false
++            }
++        }
++    }
++    /// The run is over: what it discards, while its framebuffer is still bound.
++    unsafe fn flush(&mut self, gl: &glow::Context, can_invalidate: bool) {
++        if !self.discard.is_empty() && can_invalidate {
++            unsafe { gl.invalidate_framebuffer(glow::DRAW_FRAMEBUFFER, &self.discard) };
++        }
++        self.discard.clear();
++    }
++}
++
+ impl crate::Queue for super::Queue {
+     type A = super::Api;
+ 
+@@ -1918,12 +2024,24 @@ impl crate::Queue for super::Queue {
+     ) -> Result<(), crate::DeviceError> {
+         let shared = Arc::clone(&self.shared);
+         let gl = &shared.context.lock();
++        let can_invalidate = self
++            .shared
++            .private_caps
++            .contains(PrivateCapabilities::INVALIDATE_FRAMEBUFFER);
++        let mut run = PassRun::default();
++        let glprof = std::env::var_os("HZ_EXP_GLPROF").is_some();
++        let mut times = std::collections::HashMap::<alloc::string::String, (u32, f64)>::new();
++        let all_start = std::time::Instant::now();
+         for cmd_buf in command_buffers.iter() {
++            // wgpu-core keeps a buffer for each pass's barriers, here usually empty.
++            if cmd_buf.commands.is_empty() {
++                continue;
++            }
+             // The command encoder assumes a default state when encoding the command buffer.
+             // Always reset the state between command_buffers to reflect this assumption. Do
+             // this at the beginning of the loop in case something outside of wgpu modified
+             // this state prior to commit.
+-            unsafe { self.reset_state(gl) };
++            unsafe { self.reset_state(gl, run.ended.is_some()) };
+             if let Some(ref label) = cmd_buf.label {
+                 if self
+                     .shared
+@@ -1941,7 +2059,19 @@ impl crate::Queue for super::Queue {
+             }
+ 
+             for command in cmd_buf.commands.iter() {
+-                unsafe { self.process(gl, command, &cmd_buf.data_bytes, &cmd_buf.queries) };
++                if !unsafe { run.before(gl, can_invalidate, command) } {
++                    let t = glprof.then(std::time::Instant::now);
++                    unsafe { self.process(gl, command, &cmd_buf.data_bytes, &cmd_buf.queries) };
++                    if let Some(t) = t {
++                        let name = format!("{command:?}");
++                        let kind = alloc::string::String::from(
++                            name.split(|c: char| !c.is_alphanumeric()).next().unwrap_or("?"),
++                        );
++                        let e = times.entry(kind).or_insert((0u32, 0f64));
++                        e.0 += 1;
++                        e.1 += t.elapsed().as_secs_f64();
++                    }
++                }
+             }
+ 
+             if cmd_buf.label.is_some()
+@@ -1954,6 +2084,37 @@ impl crate::Queue for super::Queue {
+             }
+         }
+ 
++        unsafe { run.flush(gl, can_invalidate) };
++        if glprof {
++            use std::sync::{atomic::{AtomicU32, Ordering}, Mutex};
++            static N: AtomicU32 = AtomicU32::new(0);
++            static ALL: Mutex<Option<(std::collections::HashMap<alloc::string::String, (u32, f64)>, f64, u32)>> =
++                Mutex::new(None);
++            let mut all = ALL.lock().unwrap();
++            let a = all.get_or_insert_with(|| (Default::default(), 0.0, 0));
++            for (k, v) in times.drain() {
++                let e = a.0.entry(k).or_insert((0, 0.0));
++                e.0 += v.0;
++                e.1 += v.1;
++            }
++            a.1 += all_start.elapsed().as_secs_f64();
++            a.2 += command_buffers.len() as u32;
++            if N.fetch_add(1, Ordering::Relaxed) % 200 == 199 {
++                let mut v: alloc::vec::Vec<_> = a.0.iter().collect();
++                v.sort_by(|x, y| y.1 .1.partial_cmp(&x.1 .1).unwrap());
++                let mut line = format!(
++                    "hzexp glprof 200 submits: all {:.2} ms/submit, {:.1} cmdbufs;",
++                    a.1 * 1000.0 / 200.0,
++                    a.2 as f64 / 200.0
++                );
++                for (k, (n, t)) in v.iter().take(16) {
++                    line += &format!(" {k} {:.1}x {:.2}ms;", *n as f64 / 200.0, t * 1000.0 / 200.0);
++                }
++                std::eprintln!("{line}");
++                *all = None;
++            }
++        }
++
+         signal_fence.maintain(gl);
+         signal_fence.signal(gl, signal_value)?;
+ 

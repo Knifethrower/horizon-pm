@@ -1,0 +1,411 @@
+From 7ebc3abb3e8ca5ccfb73073a98e0ee8d5e1b7731 Mon Sep 17 00:00:00 2001
+From: Knifethrower <andersenpeters@gmail.com>
+Date: Thu, 5 Nov 2026 02:40:15 -0500
+Subject: [PATCH] world: read gameplay-facts.json state by state for the block
+ tables
+
+Behaviours::load (the world generator's copy, on a launch with no table
+snapshot yet: the first of every new build) parsed the 55 MB
+gameplay-facts.json whole into a serde_json::Value: 540 MiB, held while
+the tables were built, on top of the rest of the load. On a 1 GB handheld
+the game was killed there.
+
+Keep each state only as the GameplayProjection the client's own path
+already uses: one state's tree at a time, the rows a few MiB. The
+projection moves down to horizon-world and takes any
+GameplayStateSource, so its fields are read through the same getters.
+
+R36S with 746 MB available, first launch: killed in 4 of 4 runs before,
+now through at a peak of 560 MB, 256 MB still available.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/horizon-items/src/blocks.rs     | 112 +------------------------
+ crates/horizon-world/src/level/data.rs | 107 +++++++++++++++++++++--
+ crates/horizon-world/src/level/mod.rs  | 105 +++++++++++++++++++++++
+ 3 files changed, 208 insertions(+), 116 deletions(-)
+
+diff --git a/crates/horizon-items/src/blocks.rs b/crates/horizon-items/src/blocks.rs
+index 8e906e1..3d85b72 100644
+--- a/crates/horizon-items/src/blocks.rs
++++ b/crates/horizon-items/src/blocks.rs
+@@ -2,6 +2,7 @@
+ //! (`gameplay-facts.json`), indexed by registry state ID.
+ mod decode;
+ use crate::Result;
++pub use horizon_world::level::GameplayProjection;
+ use horizon_world::{
+     level::{Behaviours, GameplayStateSource},
+     registry::{BlockRegistry, BlockStateId},
+@@ -110,115 +111,6 @@ impl StateFacts {
+         self.classes.iter().any(|c| &**c == name)
+     }
+ }
+-/// Compact, owned behaviour inputs retained until the normal behaviour startup stage.
+-/// No borrowed gameplay JSON or process-wide cache survives the fact loader.
+-pub struct GameplayProjection {
+-    flags: u16,
+-    emission: u64,
+-    dampening: u64,
+-    hardness: f64,
+-    push: Arc<str>,
+-    volume: f64,
+-    pitch: f64,
+-    place: Arc<str>,
+-    break_sound: Arc<str>,
+-    fall: Arc<str>,
+-}
+-
+-impl GameplayProjection {
+-    fn from_entry(entry: &decode::Entry<'_>, strings: &mut HashMap<String, Arc<str>>) -> Self {
+-        fn intern(strings: &mut HashMap<String, Arc<str>>, value: &str) -> Arc<str> {
+-            if let Some(existing) = strings.get(value) {
+-                return Arc::clone(existing);
+-            }
+-            let value_arc: Arc<str> = Arc::from(value);
+-            strings.insert(value.to_owned(), Arc::clone(&value_arc));
+-            value_arc
+-        }
+-        const FLAGS: [&str; 11] = [
+-            "replaceable",
+-            "random_ticks",
+-            "solid_render",
+-            "liquid",
+-            "block_entity",
+-            "ignited_by_lava",
+-            "can_occlude",
+-            "full_collision",
+-            "skylight_down",
+-            "requires_tool",
+-            "shape_occlusion",
+-        ];
+-        Self {
+-            flags: FLAGS.iter().enumerate().fold(0, |flags, (i, name)| {
+-                flags | ((u16::from(entry.flag(name))) << i)
+-            }),
+-            emission: entry.unsigned("emission"),
+-            dampening: entry.unsigned("dampening"),
+-            hardness: entry.number("hardness"),
+-            push: intern(strings, entry.text("push")),
+-            volume: entry.sound_number("volume"),
+-            pitch: entry.sound_number("pitch"),
+-            place: intern(strings, entry.sound_id("place")),
+-            break_sound: intern(strings, entry.sound_id("break")),
+-            fall: intern(strings, entry.sound_id("fall")),
+-        }
+-    }
+-}
+-
+-impl GameplayStateSource for GameplayProjection {
+-    fn flag(&self, name: &str) -> bool {
+-        const FLAGS: [&str; 11] = [
+-            "replaceable",
+-            "random_ticks",
+-            "solid_render",
+-            "liquid",
+-            "block_entity",
+-            "ignited_by_lava",
+-            "can_occlude",
+-            "full_collision",
+-            "skylight_down",
+-            "requires_tool",
+-            "shape_occlusion",
+-        ];
+-        FLAGS
+-            .iter()
+-            .position(|field| *field == name)
+-            .is_some_and(|index| self.flags & (1 << index) != 0)
+-    }
+-    fn unsigned(&self, name: &str) -> u64 {
+-        match name {
+-            "emission" => self.emission,
+-            "dampening" => self.dampening,
+-            _ => 0,
+-        }
+-    }
+-    fn number(&self, name: &str) -> f64 {
+-        if name == "hardness" {
+-            self.hardness
+-        } else {
+-            0.0
+-        }
+-    }
+-    fn text(&self, name: &str) -> &str {
+-        if name == "push" { &self.push } else { "" }
+-    }
+-    fn sound_number(&self, name: &str) -> f64 {
+-        match name {
+-            "volume" => self.volume,
+-            "pitch" => self.pitch,
+-            _ => 1.0,
+-        }
+-    }
+-    fn sound_id(&self, name: &str) -> &str {
+-        match name {
+-            "place" => &self.place,
+-            "break" => &self.break_sound,
+-            "fall" => &self.fall,
+-            _ => "",
+-        }
+-    }
+-}
+-
+ pub struct BlockFacts {
+     pub states: Vec<StateFacts>,
+     pub air: BlockStateId,
+@@ -250,7 +142,7 @@ impl BlockFacts {
+             let mut strings = HashMap::new();
+             Ok(entries
+                 .iter()
+-                .map(|entry| GameplayProjection::from_entry(entry, &mut strings))
++                .map(|entry| GameplayProjection::from_source(entry, &mut strings))
+                 .collect())
+         })
+     }
+diff --git a/crates/horizon-world/src/level/data.rs b/crates/horizon-world/src/level/data.rs
+index c0f26f1..4fa45ad 100644
+--- a/crates/horizon-world/src/level/data.rs
++++ b/crates/horizon-world/src/level/data.rs
+@@ -1,6 +1,6 @@
+ //! Behaviour tables built once from the pinned client resources.
+ use super::{
+-    Behaviours, GameplayStateSource,
++    Behaviours, GameplayProjection, GameplayStateSource,
+     classes::{Class, ClassSet, Interface},
+     states::{BlockId, PropKey, StateTable},
+ };
+@@ -682,11 +682,46 @@ fn build_with_behaviour_json(
+     root: &Path,
+     behaviour: &Value,
+ ) -> io::Result<Behaviours> {
+-    let gameplay = read_json(&root.join("gameplay-facts.json"))?;
+-    let gameplay_states = gameplay["states"]
+-        .as_array()
+-        .ok_or_else(|| fail("missing gameplay states"))?;
+-    build_with_gameplay(registry, root, behaviour, gameplay_states)
++    let gameplay_states = read_gameplay(&root.join("gameplay-facts.json"))?;
++    build_with_gameplay(registry, root, behaviour, &gameplay_states)
++}
++
++/// `gameplay-facts.json` with each state kept only as what the tables read. The file is 55 MB:
++/// whole as a `Value` tree it held 540 MiB through a first launch's table build, past what a
++/// 1 GB handheld has beside the rest of the load, and the game was killed. One state's tree at
++/// a time is next to nothing; the rows are a few MiB.
++fn read_gameplay(path: &Path) -> io::Result<Vec<GameplayProjection>> {
++    #[derive(serde::Deserialize)]
++    struct Gameplay {
++        #[serde(default, deserialize_with = "projected")]
++        states: Option<Vec<GameplayProjection>>,
++    }
++    fn projected<'de, D: serde::Deserializer<'de>>(
++        file: D,
++    ) -> Result<Option<Vec<GameplayProjection>>, D::Error> {
++        struct States;
++        impl<'de> serde::de::Visitor<'de> for States {
++            type Value = Vec<GameplayProjection>;
++            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
++                f.write_str("an array of gameplay states")
++            }
++            fn visit_seq<A: serde::de::SeqAccess<'de>>(
++                self,
++                mut states: A,
++            ) -> Result<Self::Value, A::Error> {
++                let mut strings = HashMap::new();
++                let mut rows = Vec::with_capacity(states.size_hint().unwrap_or(0));
++                while let Some(state) = states.next_element::<Value>()? {
++                    rows.push(GameplayProjection::from_source(&state, &mut strings));
++                }
++                Ok(rows)
++            }
++        }
++        file.deserialize_seq(States).map(Some)
++    }
++    let file: Gameplay =
++        serde_json::from_slice(&fs::read(path)?).map_err(|e| invalid(e.to_string()))?;
++    file.states.ok_or_else(|| fail("missing gameplay states"))
+ }
+ 
+ fn build_with_gameplay<G: GameplayStateSource>(
+@@ -1209,3 +1244,63 @@ impl GameplayStateSource for Value {
+             .unwrap_or("")
+     }
+ }
++
++#[cfg(test)]
++mod gameplay_tests {
++    use super::*;
++
++    fn read(json: &str) -> io::Result<Vec<GameplayProjection>> {
++        let dir = std::env::temp_dir().join(format!(
++            "horizon-gameplay-{}-{:?}",
++            std::process::id(),
++            std::thread::current().id()
++        ));
++        fs::create_dir_all(&dir)?;
++        let path = dir.join("gameplay-facts.json");
++        fs::write(&path, json)?;
++        let result = read_gameplay(&path);
++        fs::remove_dir_all(&dir)?;
++        result
++    }
++
++    /// A row reads as the state's own JSON does, whatever else the file holds.
++    #[test]
++    fn a_row_reads_as_the_states_json() {
++        let state = r#"{"id": 7, "emission": 12, "dampening": 3, "hardness": 1.5, "push": "BLOCK",
++            "solid_render": true, "liquid": false, "shape_occlusion": true, "unused": [1, 2],
++            "render_shape": "MODEL",
++            "sound": {"volume": 0.8, "pitch": 1.2, "place": {"id": "a:place"},
++                      "break": {"id": "a:break"}, "fall": {"id": "a:fall"}}}"#;
++        let rows = read(&format!(r#"{{"other": 1, "states": [{state}, {{}}]}}"#)).unwrap();
++        assert_eq!(rows.len(), 2);
++        let value: Value = serde_json::from_str(state).unwrap();
++        let empty = serde_json::json!({});
++        for (row, json) in [(&rows[0], &value), (&rows[1], &empty)] {
++            for flag in super::super::GAMEPLAY_FLAGS {
++                assert_eq!(row.flag(flag), json.flag(flag), "{flag}");
++            }
++            for key in ["emission", "dampening"] {
++                assert_eq!(row.unsigned(key), json.unsigned(key));
++            }
++            assert_eq!(row.number("hardness"), json.number("hardness"));
++            assert_eq!(row.text("push"), json.text("push"));
++            for key in ["volume", "pitch"] {
++                assert_eq!(row.sound_number(key), json.sound_number(key));
++            }
++            for key in ["place", "break", "fall"] {
++                assert_eq!(row.sound_id(key), json.sound_id(key));
++            }
++        }
++    }
++
++    /// What the whole tree refused, the rows refuse.
++    #[test]
++    fn a_file_without_a_states_array_fails() {
++        assert!(read("{}").is_err());
++        assert!(read(r#"{"states": 1}"#).is_err());
++        assert!(read(r#"{"states": {}}"#).is_err());
++        assert!(read("[]").is_err());
++        assert!(read("{").is_err());
++        assert!(read(r#"{"states": []}"#).unwrap().is_empty());
++    }
++}
+diff --git a/crates/horizon-world/src/level/mod.rs b/crates/horizon-world/src/level/mod.rs
+index 37bde4d..9d64f2a 100644
+--- a/crates/horizon-world/src/level/mod.rs
++++ b/crates/horizon-world/src/level/mod.rs
+@@ -684,6 +684,111 @@ pub trait GameplayStateSource {
+     fn sound_id(&self, name: &str) -> &str;
+ }
+ 
++/// The state flags [`Behaviours`] reads, in [`GameplayProjection`]'s bit order.
++const GAMEPLAY_FLAGS: [&str; 11] = [
++    "replaceable",
++    "random_ticks",
++    "solid_render",
++    "liquid",
++    "block_entity",
++    "ignited_by_lava",
++    "can_occlude",
++    "full_collision",
++    "skylight_down",
++    "requires_tool",
++    "shape_occlusion",
++];
++
++/// Compact, owned behaviour inputs: what the tables read of one state's gameplay facts.
++/// No borrowed gameplay JSON or process-wide cache survives the loader that makes them.
++pub struct GameplayProjection {
++    flags: u16,
++    emission: u64,
++    dampening: u64,
++    hardness: f64,
++    push: Arc<str>,
++    volume: f64,
++    pitch: f64,
++    place: Arc<str>,
++    break_sound: Arc<str>,
++    fall: Arc<str>,
++}
++
++impl GameplayProjection {
++    /// One state's fields from `source`, its strings shared through `strings`.
++    pub fn from_source<G: GameplayStateSource>(
++        source: &G,
++        strings: &mut HashMap<String, Arc<str>>,
++    ) -> Self {
++        fn intern(strings: &mut HashMap<String, Arc<str>>, value: &str) -> Arc<str> {
++            if let Some(existing) = strings.get(value) {
++                return Arc::clone(existing);
++            }
++            let value_arc: Arc<str> = Arc::from(value);
++            strings.insert(value.to_owned(), Arc::clone(&value_arc));
++            value_arc
++        }
++        Self {
++            flags: GAMEPLAY_FLAGS
++                .iter()
++                .enumerate()
++                .fold(0, |flags, (i, name)| {
++                    flags | ((u16::from(source.flag(name))) << i)
++                }),
++            emission: source.unsigned("emission"),
++            dampening: source.unsigned("dampening"),
++            hardness: source.number("hardness"),
++            push: intern(strings, source.text("push")),
++            volume: source.sound_number("volume"),
++            pitch: source.sound_number("pitch"),
++            place: intern(strings, source.sound_id("place")),
++            break_sound: intern(strings, source.sound_id("break")),
++            fall: intern(strings, source.sound_id("fall")),
++        }
++    }
++}
++
++impl GameplayStateSource for GameplayProjection {
++    fn flag(&self, name: &str) -> bool {
++        GAMEPLAY_FLAGS
++            .iter()
++            .position(|field| *field == name)
++            .is_some_and(|index| self.flags & (1 << index) != 0)
++    }
++    fn unsigned(&self, name: &str) -> u64 {
++        match name {
++            "emission" => self.emission,
++            "dampening" => self.dampening,
++            _ => 0,
++        }
++    }
++    fn number(&self, name: &str) -> f64 {
++        if name == "hardness" {
++            self.hardness
++        } else {
++            0.0
++        }
++    }
++    fn text(&self, name: &str) -> &str {
++        if name == "push" { &self.push } else { "" }
++    }
++    fn sound_number(&self, name: &str) -> f64 {
++        match name {
++            "volume" => self.volume,
++            "pitch" => self.pitch,
++            _ => 1.0,
++        }
++    }
++    fn sound_id(&self, name: &str) -> &str {
++        match name {
++            "place" => &self.place,
++            "break" => &self.break_sound,
++            "fall" => &self.fall,
++            _ => "",
++        }
++    }
++}
++
+ /// Immutable vanilla block-behaviour tables. Build once with [`Behaviours::load`].
+ pub struct Behaviours {
+     pub table: StateTable,
+-- 
+2.43.0
+

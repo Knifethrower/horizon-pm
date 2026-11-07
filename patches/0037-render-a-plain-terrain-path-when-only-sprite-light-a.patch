@@ -1,0 +1,212 @@
+From 8270df1ba4d466cf7b25611db5d724b37fdb0b02 Mon Sep 17 00:00:00 2001
+From: Knifethrower <andersenpeters@gmail.com>
+Date: Thu, 5 Nov 2026 12:52:42 -0500
+Subject: [PATCH] render: a plain terrain path when only sprite, light and fog
+ apply
+
+Hypothesis: with no fade, no HDR alpha, no emissive layers, no dynamic lights, no RGSS and no distant
+tiles in play, most of what a terrain vertex writes and a terrain pixel computes goes unused. On
+Mali-G31 a vertex's cost is mostly its outputs, and a shader over 32 registers runs at half
+occupancy.
+
+Change: `vs_terrain_plain`, `fs_solid_plain_opaque` and `fs_solid_plain`. A vertex writes 9 values
+instead of 17 and looks up the animated layer itself, so a pixel doesn't. Fog goes through as
+unclamped fractions, which interpolate as the distances would. The world pass picks them per frame
+when none of those features is in play, and falls back to the existing pipelines otherwise.
+
+Number that should move: fragment and vertex cycles per frame down, frame rate up, picture the same.
+Falsified if the cycles stay or pixels change.
+
+malioc, Mali-G31: vertex varying variant 32 -> 14 load/store cycles, fragment longest path 51 -> 5.25
+arithmetic cycles, 64 registers at 50% occupancy -> 25 at 100%.
+
+Measured on an R36S at 1 GB, low settings, render distance 2, frozen world, about 400 MHz GPU at
+77-80 C, on top of the previous patch:
+
+                         before      after
+  frame rate             15.8-17.3   21.5-23.3 fps
+  fragment cycles        11.8 M      7.5 M per frame
+  vertex cycles          5.2 M       3.5 M per frame
+  all GPU cycles         17 M        11 M per frame
+  screenshot             1 of 307,200 pixels differs from the tree before these patches
+
+Cost: GPU memory in the world goes from 105 to 126 MB and RSS from about 540 to 560 MB. Not the
+shaders' size: with side buckets off (47 draws instead of 78) the same shaders stay at 105 MB, so it
+looks like a driver pool stepping up. Not explained further.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/horizon-client-render/src/gfx.rs       | 48 ++++++++++++-
+ crates/horizon-client-render/src/terrain.wgsl | 68 +++++++++++++++++++
+ 2 files changed, 114 insertions(+), 2 deletions(-)
+
+diff --git a/crates/horizon-client-render/src/gfx.rs b/crates/horizon-client-render/src/gfx.rs
+index a6b6dc3..3bafc37 100644
+--- a/crates/horizon-client-render/src/gfx.rs
++++ b/crates/horizon-client-render/src/gfx.rs
+@@ -604,6 +604,10 @@ pub struct Renderer {
+     solid: wgpu::RenderPipeline,
+     /// The solid pipeline without `discard`, for faces over opaque texels: `opaque_draws`.
+     solid_opaque: wgpu::RenderPipeline,
++    /// `solid_opaque` and `solid` when the frame needs nothing but the sprite, the light and the
++    /// fog: `plain_terrain`.
++    plain_opaque: wgpu::RenderPipeline,
++    plain_rest: wgpu::RenderPipeline,
+     translucent: wgpu::RenderPipeline,
+     /// Flat section draws (`flat`), where multi-draw is emulated.
+     flat: Option<flat::Flat>,
+@@ -1962,6 +1966,28 @@ impl Renderer {
+             true,
+             None,
+         );
++        let plain_opaque = pipeline(
++            "Terrain solid, plain opaque faces",
++            "vs_terrain_plain",
++            "fs_solid_plain_opaque",
++            &terrain_buffers,
++            tri,
++            Some(wgpu::Face::Back),
++            true,
++            true,
++            None,
++        );
++        let plain_rest = pipeline(
++            "Terrain solid, plain",
++            "vs_terrain_plain",
++            "fs_solid_plain",
++            &terrain_buffers,
++            tri,
++            Some(wgpu::Face::Back),
++            true,
++            true,
++            None,
++        );
+         let solid_mirror = pipeline(
+             "Terrain solid (mirrored)",
+             "vs_terrain",
+@@ -3559,6 +3585,8 @@ impl Renderer {
+             crosshair_group,
+             crosshair_globals,
+             solid_opaque,
++            plain_opaque,
++            plain_rest,
+             solid_mirror,
+             mirror_globals,
+             mirror_group,
+@@ -6750,9 +6778,25 @@ impl Renderer {
+                         }
+                         // A shader pack's material draws them all alike.
+                         None if opaque_draws > 0 && material.is_none() => {
+-                            pass.set_pipeline(&self.solid_opaque);
++                            // What `solid_color` tests, none of them in play this frame: nothing
++                            // reads the alpha without HDR output, and RGSS samples otherwise.
++                            let plain_terrain = self.hdr.is_none()
++                                && self.texture_filtering != 1
++                                && frame.chunk_fade <= 0.0
++                                && frame.dynamic_lights.is_empty()
++                                && frame.colored_lights.is_empty()
++                                && frame.emissive_layers.is_empty();
++                            pass.set_pipeline(if plain_terrain {
++                                &self.plain_opaque
++                            } else {
++                                &self.solid_opaque
++                            });
+                             self.draw_sections(&mut pass, &self.indirect, 0, 0, opaque_draws);
+-                            pass.set_pipeline(solid_pipeline);
++                            pass.set_pipeline(if plain_terrain {
++                                &self.plain_rest
++                            } else {
++                                solid_pipeline
++                            });
+                             self.draw_sections(
+                                 &mut pass,
+                                 &self.indirect,
+diff --git a/crates/horizon-client-render/src/terrain.wgsl b/crates/horizon-client-render/src/terrain.wgsl
+index 3995a21..2a4e26f 100644
+--- a/crates/horizon-client-render/src/terrain.wgsl
++++ b/crates/horizon-client-render/src/terrain.wgsl
+@@ -67,6 +67,10 @@ fn sprite_grad(uv: vec2<f32>, layer: u32, dx: vec2<f32>, dy: vec2<f32>) -> vec4<
+     if (animated_layer != 0xFFFFFFFFu) {
+         return textureSampleGrad(animated, sprite_sampler, uv, i32(animated_layer), dx, dy);
+     }
++    return stored_sprite_grad(uv, layer, dx, dy);
++}
++// The same for a sprite that does not animate.
++fn stored_sprite_grad(uv: vec2<f32>, layer: u32, dx: vec2<f32>, dy: vec2<f32>) -> vec4<f32> {
+     let l = i32(layer % SPRITE_SPLIT);
+     if SPRITE_ARRAYS == 1u {
+         return textureSampleGrad(sprites, sprite_sampler, uv, l, dx, dy);
+@@ -357,6 +361,70 @@ fn brightness(c: vec3<f32>) -> f32 {
+ @fragment fn fs_solid(in: TerrainOut) -> @location(0) vec4<f32> {
+     return solid_color(in);
+ }
++// Whole sections when nothing but the sprite, the light and the fog applies (gfx.rs's
++// `plain_terrain`): no fade, no HDR alpha, no emissive layers, no dynamic lights, no RGSS, no distant
++// tiles. The same picture from far less work: a vertex writes 9 values instead of 17, and a pixel
++// neither looks its layer up (the vertex did) nor divides for its fog.
++struct PlainOut {
++    @builtin(position) clip: vec4<f32>,
++    @location(0) uv: vec2<f32>,
++    // The layer in `animated` with `PLAIN_ANIMATED` set, or else in the sprite arrays.
++    @location(1) @interpolate(flat) layer: u32,
++    @location(2) color: vec4<f32>,
++    // `linear_fog`'s two fractions, not yet clamped: they interpolate as the distances would.
++    @location(3) fog: vec2<f32>,
++}
++const PLAIN_ANIMATED: u32 = 0x80000000u;
++fn fog_fraction(d: f32, start: f32, end: f32) -> f32 {
++    return (d - start) / max(end - start, 1e-6);
++}
++@vertex fn vs_terrain_plain(
++    @location(0) position: vec3<f32>, @location(1) uv: vec2<u32>,
++    @location(2) layer: u32, @location(3) color: vec4<f32>, @location(4) light: vec2<u32>,
++    @location(5) origin: vec4<f32>) -> PlainOut {
++    let pos = position + origin.xyz;
++    var out: PlainOut;
++    out.clip = globals.view_proj * vec4(pos, 1.0);
++    out.uv = terrain_uv(uv, origin.w);
++    let sprite = layer & 0x7fffu;
++    let animated_layer = textureLoad(layer_map, vec2<i32>(i32(sprite), 0), 0).r;
++    out.layer = select(sprite, animated_layer | PLAIN_ANIMATED, animated_layer != 0xFFFFFFFFu);
++    out.color = vec4(color.rgb, 1.0) * sample_lightmap(f32(light.x) / 16.0, f32(light.y) / 16.0);
++    out.fog = vec2(fog_fraction(length(pos), globals.fog.x, globals.fog.y),
++        fog_fraction(max(length(pos.xz), abs(pos.y)), globals.fog.z, globals.fog.w));
++    return out;
++}
++fn plain_texel(in: PlainOut) -> vec4<f32> {
++    let du = dpdx(in.uv);
++    let dv = dpdy(in.uv);
++    let pixel = vec2(1.0 / globals.filtering.y);
++    let texel_screen = sqrt(du * du + dv * dv);
++    // sample_nearest's arithmetic (texture_sampling.glsl)
++    let texel_coords = in.uv / pixel;
++    let center = round(texel_coords) - 0.5;
++    var offset = texel_coords - center;
++    offset = (offset - 0.5) * pixel / max(texel_screen, vec2(1e-12)) + 0.5;
++    offset = clamp(offset, vec2(0.0), vec2(1.0));
++    let uv = (center + offset) * pixel;
++    if (in.layer & PLAIN_ANIMATED) != 0u {
++        return textureSampleGrad(animated, sprite_sampler, uv, i32(in.layer & 0x7fffffffu), du, dv);
++    }
++    return stored_sprite_grad(uv, in.layer, du, dv);
++}
++fn plain_lit(in: PlainOut, texel: vec4<f32>) -> vec4<f32> {
++    let f = clamp(max(in.fog.x, in.fog.y), 0.0, 1.0);
++    return vec4(mix(texel.rgb * in.color.rgb, globals.fog_color.rgb, f * globals.fog_color.a), 1.0);
++}
++// `plain_terrain` of `fs_solid_opaque`: no `discard`.
++@fragment fn fs_solid_plain_opaque(in: PlainOut) -> @location(0) vec4<f32> {
++    return plain_lit(in, plain_texel(in));
++}
++// `plain_terrain` of `fs_solid`: the rest, with their cut-out texels.
++@fragment fn fs_solid_plain(in: PlainOut) -> @location(0) vec4<f32> {
++    let texel = plain_texel(in);
++    if texel.a * in.color.a < 0.5 { discard; }
++    return plain_lit(in, texel);
++}
+ // Whole sections' faces over opaque texels (mesher/sides.rs): what `solid_color` gives them, as
+ // neither of its discards can fire. A shader without `discard` lets a tile-based GPU reject hidden
+ // pixels and write depth early.
+-- 
+2.43.0
+

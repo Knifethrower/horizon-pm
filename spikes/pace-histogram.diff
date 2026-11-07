@@ -1,0 +1,32 @@
+diff --git a/crates/horizon-client/src/game.rs b/crates/horizon-client/src/game.rs
+index 6186ebb..3bdd4e5 100644
+--- a/crates/horizon-client/src/game.rs
++++ b/crates/horizon-client/src/game.rs
+@@ -16830,6 +16830,27 @@ impl Game<'_> {
+                         log::warn!("Horizon: couldn't save the world icon: {error}");
+                     }
+                     if rendered {
++                        {
++                            use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
++                            static BUCKETS: [AtomicU32; 5] = [const { AtomicU32::new(0) }; 5];
++                            static CHANGES: AtomicU32 = AtomicU32::new(0);
++                            static LAST: AtomicU32 = AtomicU32::new(0);
++                            static N: AtomicU32 = AtomicU32::new(0);
++                            let v = ((elapsed.as_secs_f32() * 1000.0 / 16.667).round() as u32).clamp(1, 5);
++                            BUCKETS[v as usize - 1].fetch_add(1, Relaxed);
++                            if LAST.swap(v, Relaxed) != v {
++                                CHANGES.fetch_add(1, Relaxed);
++                            }
++                            if N.fetch_add(1, Relaxed) + 1 == 250 {
++                                N.store(0, Relaxed);
++                                let b: Vec<u32> = BUCKETS.iter().map(|b| b.swap(0, Relaxed)).collect();
++                                log::info!(
++                                    "Horizon: pace 1v {} 2v {} 3v {} 4v {} 5v+ {} changes {}",
++                                    b[0], b[1], b[2], b[3], b[4],
++                                    CHANGES.swap(0, Relaxed)
++                                );
++                            }
++                        }
+                         self.frame_stats.record(elapsed.as_secs_f32() * 1000.0);
+                         self.debug_charts.frame_times.log(elapsed.as_nanos() as i64);
+                         if self.frames == 0 {

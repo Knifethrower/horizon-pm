@@ -1,0 +1,135 @@
+diff --git a/third_party/wgpu-hal/src/gles/egl.rs b/third_party/wgpu-hal/src/gles/egl.rs
+index 90ce352..1ff0d26 100644
+--- a/third_party/wgpu-hal/src/gles/egl.rs
++++ b/third_party/wgpu-hal/src/gles/egl.rs
+@@ -271,6 +271,55 @@ struct EglContextLock<'a> {
+ pub struct AdapterContextLock<'a> {
+     glow: MutexGuard<'a, ManuallyDrop<glow::Context>>,
+     egl: Option<EglContextLock<'a>>,
++    since: std::time::Instant,
++    at: &'static core::panic::Location<'static>,
++}
++
++pub(super) mod lockstat {
++    use std::collections::BTreeMap;
++    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
++    use std::sync::Mutex;
++    pub static TABLE: Mutex<BTreeMap<(&'static str, u32), (u64, u64)>> = Mutex::new(BTreeMap::new());
++    pub static MAKE_CURRENT_NS: AtomicU64 = AtomicU64::new(0);
++    pub static MAKE_CURRENT_N: AtomicU64 = AtomicU64::new(0);
++    pub static BLIT_NS: AtomicU64 = AtomicU64::new(0);
++    pub static SWAP_NS: AtomicU64 = AtomicU64::new(0);
++    pub static PRESENTS: AtomicU64 = AtomicU64::new(0);
++    pub fn presented() {
++        const EVERY: u64 = 200;
++        if PRESENTS.fetch_add(1, Relaxed) + 1 < EVERY {
++            return;
++        }
++        PRESENTS.store(0, Relaxed);
++        let mut table = TABLE.lock().unwrap();
++        let mut rows: alloc::vec::Vec<_> = table.iter().map(|(k, v)| (*k, *v)).collect();
++        rows.sort_by_key(|r| core::cmp::Reverse(r.1 .1));
++        let n = EVERY as f64;
++        let (mut count, mut held) = (0u64, 0u64);
++        for r in &rows {
++            count += r.1 .0;
++            held += r.1 .1;
++        }
++        std::eprintln!(
++            "[locks] per frame: {:.1} locks, {:.2} ms held, make_current {:.1} calls {:.2} ms, blit {:.2} ms, swap {:.2} ms",
++            count as f64 / n,
++            held as f64 / n / 1e6,
++            MAKE_CURRENT_N.swap(0, Relaxed) as f64 / n,
++            MAKE_CURRENT_NS.swap(0, Relaxed) as f64 / n / 1e6,
++            BLIT_NS.swap(0, Relaxed) as f64 / n / 1e6,
++            SWAP_NS.swap(0, Relaxed) as f64 / n / 1e6,
++        );
++        for r in rows.iter().take(14) {
++            std::eprintln!(
++                "[locks]   {:>7.1} per frame {:>7.3} ms  {}:{}",
++                r.1 .0 as f64 / n,
++                r.1 .1 as f64 / n / 1e6,
++                r.0 .0.rsplit('/').next().unwrap_or(r.0 .0),
++                r.0 .1
++            );
++        }
++        table.clear();
++    }
+ }
+ 
+ impl<'a> core::ops::Deref for AdapterContextLock<'a> {
+@@ -283,11 +332,20 @@ impl<'a> core::ops::Deref for AdapterContextLock<'a> {
+ 
+ impl<'a> Drop for AdapterContextLock<'a> {
+     fn drop(&mut self) {
++        use core::sync::atomic::Ordering::Relaxed;
++        let held = self.since.elapsed().as_nanos() as u64;
++        let t = std::time::Instant::now();
+         if let Some(egl) = self.egl.take() {
+             if let Err(err) = egl.instance.make_current(egl.display, None, None, None) {
+                 log::error!("Failed to make EGL context current: {err:?}");
+             }
+         }
++        lockstat::MAKE_CURRENT_NS.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
++        lockstat::MAKE_CURRENT_N.fetch_add(1, Relaxed);
++        let mut table = lockstat::TABLE.lock().unwrap();
++        let e = table.entry((self.at.file(), self.at.line())).or_insert((0, 0));
++        e.0 += 1;
++        e.1 += held;
+     }
+ }
+ 
+@@ -322,6 +380,7 @@ impl AdapterContext {
+             .try_lock_for(Duration::from_secs(CONTEXT_LOCK_TIMEOUT_SECS))
+             .expect("Could not lock adapter context. This is most-likely a deadlock.");
+ 
++        let t = std::time::Instant::now();
+         let egl = self.egl.as_ref().map(|egl| {
+             egl.make_current();
+             EglContextLock {
+@@ -329,8 +388,18 @@ impl AdapterContext {
+                 display: egl.display,
+             }
+         });
++        {
++            use core::sync::atomic::Ordering::Relaxed;
++            lockstat::MAKE_CURRENT_NS.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
++            lockstat::MAKE_CURRENT_N.fetch_add(1, Relaxed);
++        }
+ 
+-        AdapterContextLock { glow, egl }
++        AdapterContextLock {
++            glow,
++            egl,
++            since: std::time::Instant::now(),
++            at: core::panic::Location::caller(),
++        }
+     }
+ }
+ 
+@@ -1115,6 +1184,7 @@ impl Surface {
+         _suf_texture: super::Texture,
+         context: &AdapterContext,
+     ) -> Result<(), crate::SurfaceError> {
++        let t_blit = std::time::Instant::now();
+         let gl = unsafe { context.get_without_egl_lock() };
+         let swapchain = self.swapchain.read();
+         let sc = swapchain.as_ref().ok_or(crate::SurfaceError::Other(
+@@ -1176,6 +1246,8 @@ impl Surface {
+         }
+ 
+         unsafe { gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None) };
++        lockstat::BLIT_NS.fetch_add(t_blit.elapsed().as_nanos() as u64, core::sync::atomic::Ordering::Relaxed);
++        let t_swap = std::time::Instant::now();
+ 
+         self.egl
+             .instance
+@@ -1192,6 +1264,8 @@ impl Surface {
+                 log::error!("make_current(null) failed: {e}");
+                 crate::SurfaceError::Lost
+             })?;
++        lockstat::SWAP_NS.fetch_add(t_swap.elapsed().as_nanos() as u64, core::sync::atomic::Ordering::Relaxed);
++        lockstat::presented();
+ 
+         Ok(())
+     }

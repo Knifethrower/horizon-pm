@@ -1,0 +1,659 @@
+From c97aafdde2e10f3e1d1fc6589fda45c22bc20ebe Mon Sep 17 00:00:00 2001
+From: Knifethrower <andersenpeters@gmail.com>
+Date: Wed, 4 Nov 2026 18:20:32 -0500
+Subject: [PATCH 33/34] render: load the shared atlas's static rows from their
+ ASTC bake
+
+With its run-time rows in a texture of their own (previous patch), the
+shared atlas's static part takes no writes, so it can be ASTC 4x4: a byte
+a texel instead of four. `--bake-atlas`, which the port's patcher runs,
+already baked the whole atlas, but nothing could load it.
+
+The bake now covers only the static rows, and is named by their size and
+content key (HudAtlas::static_key, read while the packed pixels are still
+in memory): before, its name was only the atlas's size, so a pack with
+another atlas of that size would have loaded the wrong textures. Earlier
+atlas bakes in the cache folder are deleted when a new one is written.
+
+The renderer loads the bake when this GPU samples ASTC (the capability,
+astc::supported) and the RGBA spill is there, then streams only the
+dynamic rows from the spill; the log says which:
+  shared atlas static rows 4096x2152 from their ASTC bake (8 MiB),
+  dynamic rows 4096x2968 RGBA (46 MiB)
+Without the bake or the capability nothing changes. The whole-atlas copy
+for shader packs, pack text shaders and native mods reads the static rows
+from that spill, since an ASTC texture copies into no RGBA one.
+
+On the default resources the atlas then takes 55 MiB of GPU memory instead
+of 80, and a launch reads 46 MiB of it from the card instead of 80. Text
+from the bitmap fonts draws texel for texel as from RGBA; GUI sprites differ
+in a few edge shades (checked on PC, Mesa's GL with ASTC).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/horizon-client-render/src/astc.rs      |  52 +++++--
+ crates/horizon-client-render/src/gfx.rs       |  73 ++++++++--
+ .../src/gfx/end_sky/tests.rs                  |   2 +-
+ .../src/gfx/shared_atlas.rs                   | 136 +++++++++++++++---
+ crates/horizon-client-render/src/hud.rs       |  16 ++-
+ crates/horizon-client/src/game.rs             |  50 +++++--
+ 6 files changed, 277 insertions(+), 52 deletions(-)
+
+diff --git a/crates/horizon-client-render/src/astc.rs b/crates/horizon-client-render/src/astc.rs
+index 4f4e4e2..87d8289 100644
+--- a/crates/horizon-client-render/src/astc.rs
++++ b/crates/horizon-client-render/src/astc.rs
+@@ -46,10 +46,14 @@ pub fn supported(device: &wgpu::Device) -> bool {
+         .contains(wgpu::Features::TEXTURE_COMPRESSION_ASTC)
+ }
+ 
+-/// The baked file beside a spill: `hud-atlas-4096x5120.rgba` -> `.astc`.
+-pub fn cache_path(rgba: &Path) -> PathBuf {
+-    rgba.with_extension("astc")
++/// The bake of a shared atlas's static rows (`HudAtlas::static_rows`): its
++/// width, those rows and their content key (`HudAtlas::static_key`), so a bake
++/// of other textures of the same size is never taken for this one.
++pub fn atlas_path(dir: &Path, width: u32, rows: u32, key: u64) -> PathBuf {
++    dir.join(format!("{ATLAS_PREFIX}{width}x{rows}-{key:016x}.astc"))
+ }
++/// The start of every shared atlas bake's name, old ones included.
++pub const ATLAS_PREFIX: &str = "hud-atlas-";
+ 
+ /// The encoder to run: `tools/astcenc` beside the executable, or
+ /// `HORIZON_ASTCENC`. `None` leaves the RGBA path in place.
+@@ -68,26 +72,26 @@ pub fn find_encoder() -> Option<PathBuf> {
+         .find(|path| path.is_file())
+ }
+ 
+-/// Upload a baked image as a texture, or `None` when the file is missing, the
+-/// wrong size for this atlas, or unreadable. The file holds raw blocks (a bake
+-/// from an older build may still carry `astcenc`'s 16-byte container header,
+-/// which is skipped). Streams a band of block rows at a time so the transient
+-/// copy stays a megabyte or two, as the RGBA path does.
++/// Upload the baked image at `path` as a texture, or `None` when this GPU
++/// does not sample ASTC, or the file is missing, the wrong size for this
++/// image, or unreadable. The file holds raw blocks (a bake from an older build
++/// may still carry `astcenc`'s 16-byte container header, which is skipped).
++/// Streams a band of block rows at a time so the transient copy stays a
++/// megabyte or two, as the RGBA path does.
+ pub fn load(
+     device: &wgpu::Device,
+     queue: &wgpu::Queue,
+-    rgba: &Path,
++    path: &Path,
+     width: u32,
+     height: u32,
+     label: &str,
+ ) -> Option<wgpu::Texture> {
+-    let path = cache_path(rgba);
+     let want = encoded_len(width, height);
+     if !supported(device) {
+         return None;
+     }
+-    let mut file = std::io::BufReader::new(std::fs::File::open(&path).ok()?);
+-    let len = std::fs::metadata(&path).ok()?.len();
++    let mut file = std::io::BufReader::new(std::fs::File::open(path).ok()?);
++    let len = std::fs::metadata(path).ok()?.len();
+     if len == want + 16 {
+         // A bake from a build that kept `astcenc`'s container header: the
+         // blocks are the same, they just start sixteen bytes in.
+@@ -586,3 +590,27 @@ pub fn encode_array(
+     }
+     std::fs::rename(&tmp, out).map_err(|e| format!("{}: {e}", out.display()))
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// The bake of a shared atlas's static rows is named by their size and
++    /// content key: another pack's atlas of the same size never matches it.
++    #[test]
++    fn an_atlas_bake_is_named_by_its_content() {
++        let dir = Path::new("cache");
++        let path = atlas_path(dir, 4096, 2608, 0xabc);
++        assert_eq!(
++            path,
++            Path::new("cache/hud-atlas-4096x2608-0000000000000abc.astc")
++        );
++        assert_ne!(path, atlas_path(dir, 4096, 2608, 0xabd));
++        assert!(
++            path.file_name()
++                .unwrap()
++                .to_string_lossy()
++                .starts_with(ATLAS_PREFIX)
++        );
++    }
++}
+diff --git a/crates/horizon-client-render/src/gfx.rs b/crates/horizon-client-render/src/gfx.rs
+index 75518b6..81af7b6 100644
+--- a/crates/horizon-client-render/src/gfx.rs
++++ b/crates/horizon-client-render/src/gfx.rs
+@@ -1545,8 +1545,8 @@ impl Renderer {
+         layers: u32,
+         sprite_mips: &[crate::mipmap::Settings],
+         animations: &[SpriteAnimation],
+-        // Pixels, width, height and static rows (`HudAtlas::static_rows`).
+-        hud_atlas: (&[u8], u32, u32, u32),
++        // Pixels, width, height, static rows and their key (`HudAtlas::static_rows`, `static_key`).
++        hud_atlas: (&[u8], u32, u32, u32, u64),
+         hud_atlas_file: Option<&std::path::Path>,
+         glint: (&[u8], u32, u32),
+         glint_armor: (&[u8], u32, u32),
+@@ -2337,7 +2337,8 @@ impl Renderer {
+             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+             mapped_at_creation: false,
+         });
+-        let (atlas_pixels, atlas_width, atlas_height, atlas_static_rows) = hud_atlas;
++        let (atlas_pixels, atlas_width, atlas_height, atlas_static_rows, atlas_static_key) =
++            hud_atlas;
+         log::info!(
+             "Horizon: shared atlas {atlas_width}x{atlas_height}, {} MiB",
+             u64::from(atlas_width) * u64::from(atlas_height) * 4 / (1024 * 1024)
+@@ -2360,7 +2361,36 @@ impl Renderer {
+             });
+         // The atlas is two textures (`shared_atlas`): the static rows, packed
+         // once, and the rows the game writes while it runs (font glyphs, skins,
+-        // maps), which take RGBA at arbitrary positions.
++        // maps), which take RGBA at arbitrary positions. The static rows come
++        // from their ASTC bake (`--bake-atlas`) when this GPU samples ASTC and
++        // the spill is there for the whole-atlas copy to read them from.
++        let bake = || -> Option<shared_atlas::Baked> {
++            let source = hud_atlas_file?;
++            let path = astc::atlas_path(
++                source.parent()?,
++                atlas_width,
++                atlas_static_rows,
++                atlas_static_key,
++            );
++            let texture = astc::load(
++                &device,
++                &queue,
++                &path,
++                atlas_width,
++                atlas_static_rows,
++                "Shared atlas (static rows, ASTC)",
++            );
++            if texture.is_none() && astc::supported(&device) {
++                log::info!(
++                    "Horizon: no ASTC bake {} for the shared atlas's static rows, uploading RGBA",
++                    path.display()
++                );
++            }
++            Some(shared_atlas::Baked {
++                texture: texture?,
++                source: source.to_owned(),
++            })
++        };
+         let atlas = match reused {
+             Some(atlas) => {
+                 log::info!(
+@@ -2385,6 +2415,7 @@ impl Renderer {
+                     atlas_width,
+                     atlas_height,
+                     atlas_static_rows,
++                    bake(),
+                 );
+                 let started = std::time::Instant::now();
+                 let bytes_per_row = atlas_width * 4;
+@@ -2393,7 +2424,8 @@ impl Renderer {
+                 let mut file = std::fs::File::open(path).map_err(|e| {
+                     format!("the shared atlas at {}: {e}", path.display())
+                 })?;
+-                let mut y = 0;
++                // Rows a bake holds already are not read.
++                let mut y = atlas.first_upload_row();
+                 while y < atlas_height {
+                     let height = rows.min(atlas_height - y);
+                     let len = (height * bytes_per_row) as usize;
+@@ -2417,6 +2449,7 @@ impl Renderer {
+                     atlas_width,
+                     atlas_height,
+                     atlas_static_rows,
++                    bake(),
+                 );
+                 // `create_texture_with_data` stages the whole atlas (80 MiB on
+                 // the default resources) in one buffer, which lands beside the
+@@ -2425,7 +2458,7 @@ impl Renderer {
+                 // the transient copy stays a few MiB.
+                 let bytes_per_row = atlas_width * 4;
+                 let rows = (4 * 1024 * 1024 / bytes_per_row).clamp(1, atlas_height);
+-                let mut y = 0;
++                let mut y = atlas.first_upload_row();
+                 while y < atlas_height {
+                     let height = rows.min(atlas_height - y);
+                     let start = (y * bytes_per_row) as usize;
+@@ -2441,6 +2474,19 @@ impl Renderer {
+                 atlas
+             }
+         };
++        let (upper, lower) = atlas.bytes();
++        log::info!(
++            "Horizon: shared atlas static rows {atlas_width}x{} {} ({} MiB), dynamic rows {atlas_width}x{} RGBA ({} MiB)",
++            atlas.static_rows,
++            if atlas.compressed() {
++                "from their ASTC bake"
++            } else {
++                "RGBA"
++            },
++            upper / (1024 * 1024),
++            atlas.height - atlas.static_rows,
++            lower / (1024 * 1024)
++        );
+         let atlas_view = atlas.static_view.clone();
+         let atlas_dynamic_view = atlas.dynamic_view.clone();
+         // vanilla's `GlintSampler`: enchanted_glint_item as its own texture,
+@@ -4496,7 +4542,7 @@ impl Renderer {
+             let atlas = self.hud.atlas.as_mut()?;
+             let mut encoder = self.device.create_command_encoder(&Default::default());
+             let view = atlas
+-                .combined(&self.device, &mut encoder)
++                .combined(&self.device, &self.queue, &mut encoder)
+                 .create_view(&Default::default());
+             self.queue.submit([encoder.finish()]);
+             Some(view)
+@@ -7064,7 +7110,9 @@ impl Renderer {
+             // (made when the pack was set).
+             let weather = match self.hud.atlas.as_mut() {
+                 Some(atlas) if pack_draws_weather => {
+-                    let atlas = atlas.combined(&self.device, &mut encoder).clone();
++                    let atlas = atlas
++                        .combined(&self.device, &self.queue, &mut encoder)
++                        .clone();
+                     self.pack_weather
+                         .get_or_insert_with(|| pack_weather::PackWeather::new(&self.device))
+                         .prepare(
+@@ -7191,10 +7239,11 @@ impl Renderer {
+         if !frame.title {
+             // A mod that samples the shared atlas gets it whole (`RenderNeeds::atlas`).
+             let mod_atlas = if native_render::render_needs().atlas {
+-                self.hud
+-                    .atlas
+-                    .as_mut()
+-                    .map(|atlas| atlas.combined(&self.device, &mut encoder).clone())
++                self.hud.atlas.as_mut().map(|atlas| {
++                    atlas
++                        .combined(&self.device, &self.queue, &mut encoder)
++                        .clone()
++                })
+             } else {
+                 None
+             };
+diff --git a/crates/horizon-client-render/src/gfx/end_sky/tests.rs b/crates/horizon-client-render/src/gfx/end_sky/tests.rs
+index dc16fd2..48281a5 100644
+--- a/crates/horizon-client-render/src/gfx/end_sky/tests.rs
++++ b/crates/horizon-client-render/src/gfx/end_sky/tests.rs
+@@ -167,7 +167,7 @@ fn separate_draws_match_combined_celestial_pixels() {
+         .collect();
+     // The shared atlas as the game holds it (gfx/shared_atlas.rs): these 16
+     // rows are its static part, with a row of dynamic part below them.
+-    let atlas = crate::gfx::shared_atlas::SharedAtlas::new(&device, 16, 17, 16);
++    let atlas = crate::gfx::shared_atlas::SharedAtlas::new(&device, 16, 17, 16, None);
+     atlas.write_rows(&queue, 0, &pixels);
+     let lightmap = texture(&[255; 4], 1, 1).create_view(&Default::default());
+     let sampler = device.create_sampler(&Default::default());
+diff --git a/crates/horizon-client-render/src/gfx/shared_atlas.rs b/crates/horizon-client-render/src/gfx/shared_atlas.rs
+index 41da910..7945bcc 100644
+--- a/crates/horizon-client-render/src/gfx/shared_atlas.rs
++++ b/crates/horizon-client-render/src/gfx/shared_atlas.rs
+@@ -5,10 +5,14 @@
+ //! game's shaders read them as one (`atlas_sample` in hud.wgsl, entity.wgsl and
+ //! screen.wgsl), so the static part can be held in a form that takes no run-time writes.
+ //!
++//! The static part is the ASTC bake of those rows ([`Baked`]) when there is one and the GPU
++//! samples ASTC: a byte a texel instead of four. It then takes no writes at all.
++//!
+ //! What samples the atlas without those shaders (a resource pack's text shader, a shader
+ //! pack, a native mod) gets [`SharedAtlas::combined`]: both parts in one texture, made the
+ //! first time it is asked for and kept up to date from then on.
+ use super::upload::Uploads;
++use std::path::PathBuf;
+ 
+ #[derive(Clone)]
+ pub struct SharedAtlas {
+@@ -21,9 +25,19 @@ pub struct SharedAtlas {
+     dynamic_part: wgpu::Texture,
+     pub static_view: wgpu::TextureView,
+     pub dynamic_view: wgpu::TextureView,
++    /// With an ASTC static part: the RGBA spill of the whole atlas, which
++    /// [`Self::combined`] reads the static rows from.
++    static_source: Option<PathBuf>,
+     combined: Option<wgpu::Texture>,
+ }
+ 
++/// The static rows as their ASTC bake, and the RGBA spill of the whole atlas
++/// they were baked from (an ASTC texture copies into no RGBA texture).
++pub struct Baked {
++    pub texture: wgpu::Texture,
++    pub source: PathBuf,
++}
++
+ /// The rows `y..y + rows` of the atlas that fall in one part: the part, the
+ /// first of them in it, and where they start among `rows`.
+ struct Span<'a> {
+@@ -34,12 +48,25 @@ struct Span<'a> {
+ }
+ 
+ impl SharedAtlas {
+-    /// Empty textures for a `width` by `height` atlas whose first `static_rows`
+-    /// rows are its static part. Both parts keep at least a row.
+-    pub fn new(device: &wgpu::Device, width: u32, height: u32, static_rows: u32) -> Self {
++    /// Textures for a `width` by `height` atlas whose first `static_rows` rows
++    /// are its static part: `baked` for those when given, else empty RGBA ones.
++    /// Both parts keep at least a row.
++    pub fn new(
++        device: &wgpu::Device,
++        width: u32,
++        height: u32,
++        static_rows: u32,
++        baked: Option<Baked>,
++    ) -> Self {
+         let height = height.max(2);
+         let static_rows = static_rows.clamp(1, height - 1);
+-        let static_part = rgba_texture(device, "Shared atlas (static rows)", width, static_rows);
++        let (static_part, static_source) = match baked {
++            Some(baked) => (baked.texture, Some(baked.source)),
++            None => (
++                rgba_texture(device, "Shared atlas (static rows)", width, static_rows),
++                None,
++            ),
++        };
+         let dynamic_part = rgba_texture(
+             device,
+             "Shared atlas (dynamic rows)",
+@@ -54,13 +81,40 @@ impl SharedAtlas {
+             dynamic_view: dynamic_part.create_view(&Default::default()),
+             static_part,
+             dynamic_part,
++            static_source,
+             combined: None,
+         }
+     }
+-    /// The parts rows `y..y + rows` fall in.
++    /// Whether the static part is the ASTC bake, which takes no writes.
++    pub fn compressed(&self) -> bool {
++        self.static_source.is_some()
++    }
++    /// The first row the packed pixels still have to be uploaded from: past
++    /// the static rows when their bake holds them already.
++    pub fn first_upload_row(&self) -> u32 {
++        if self.compressed() {
++            self.static_rows
++        } else {
++            0
++        }
++    }
++    /// What the GPU holds of each part, in bytes: (static, dynamic).
++    pub fn bytes(&self) -> (u64, u64) {
++        let rgba = |rows: u32| u64::from(self.width) * u64::from(rows) * 4;
++        let upper = if self.compressed() {
++            crate::astc::encoded_len(self.width, self.static_rows)
++        } else {
++            rgba(self.static_rows)
++        };
++        (upper, rgba(self.height - self.static_rows))
++    }
++    /// The parts rows `y..y + rows` fall in that can be written: not the static
++    /// part when it is the ASTC bake.
+     fn spans(&self, y: u32, rows: u32) -> impl Iterator<Item = Span<'_>> {
+-        split_rows(self.static_rows, self.height, y, rows).map(move |(dynamic, top, skip, rows)| {
+-            Span {
++        let compressed = self.compressed();
++        split_rows(self.static_rows, self.height, y, rows)
++            .filter(move |&(dynamic, ..)| dynamic || !compressed)
++            .map(move |(dynamic, top, skip, rows)| Span {
+                 texture: if dynamic {
+                     &self.dynamic_part
+                 } else {
+@@ -69,8 +123,7 @@ impl SharedAtlas {
+                 top,
+                 skip,
+                 rows,
+-            }
+-        })
++            })
+     }
+     /// Write whole rows of the atlas from row `y` (tightly packed RGBA, the full
+     /// width) through the queue: the upload of its packed pixels.
+@@ -138,24 +191,35 @@ impl SharedAtlas {
+         }
+     }
+     /// The whole atlas as one RGBA texture, for what samples it without the
+-    /// game's shaders: copied from the two parts the first time, then kept up to
++    /// game's shaders: copied from the two parts the first time (the static
++    /// rows read from the spill when they are the ASTC bake), then kept up to
+     /// date by [`Self::write`]. It costs the memory the split saves, so only
+     /// those users make it.
+     pub fn combined(
+         &mut self,
+         device: &wgpu::Device,
++        queue: &wgpu::Queue,
+         encoder: &mut wgpu::CommandEncoder,
+     ) -> &wgpu::Texture {
+         if self.combined.is_none() {
+             let texture = rgba_texture(device, "Shared atlas (whole)", self.width, self.height);
+-            for (part, y, rows) in [
+-                (&self.static_part, 0, self.static_rows),
+-                (
+-                    &self.dynamic_part,
+-                    self.static_rows,
+-                    self.height - self.static_rows,
+-                ),
+-            ] {
++            let mut parts = vec![(
++                &self.dynamic_part,
++                self.static_rows,
++                self.height - self.static_rows,
++            )];
++            match &self.static_source {
++                Some(source) => {
++                    if let Err(e) = self.static_rows_from(source, queue, &texture) {
++                        log::warn!(
++                            "Horizon: the whole shared atlas has no static rows: {}: {e}",
++                            source.display()
++                        );
++                    }
++                }
++                None => parts.push((&self.static_part, 0, self.static_rows)),
++            }
++            for (part, y, rows) in parts {
+                 encoder.copy_texture_to_texture(
+                     copy_target(part, 0, 0),
+                     copy_target(&texture, 0, y),
+@@ -175,6 +239,42 @@ impl SharedAtlas {
+         }
+         self.combined.as_ref().expect("made just above")
+     }
++    /// The static rows of the RGBA spill at `source` into `texture`, a band at
++    /// a time, so the transient copy stays a few MiB.
++    fn static_rows_from(
++        &self,
++        source: &std::path::Path,
++        queue: &wgpu::Queue,
++        texture: &wgpu::Texture,
++    ) -> std::io::Result<()> {
++        use std::io::Read as _;
++        let bytes_per_row = self.width * 4;
++        let band = (4 * 1024 * 1024 / bytes_per_row).clamp(1, self.static_rows);
++        let mut buf = vec![0u8; (band * bytes_per_row) as usize];
++        let mut file = std::fs::File::open(source)?;
++        let mut y = 0;
++        while y < self.static_rows {
++            let rows = band.min(self.static_rows - y);
++            let len = (rows * bytes_per_row) as usize;
++            file.read_exact(&mut buf[..len])?;
++            queue.write_texture(
++                copy_target(texture, 0, y),
++                &buf[..len],
++                wgpu::TexelCopyBufferLayout {
++                    offset: 0,
++                    bytes_per_row: Some(bytes_per_row),
++                    rows_per_image: Some(rows),
++                },
++                wgpu::Extent3d {
++                    width: self.width,
++                    height: rows,
++                    depth_or_array_layers: 1,
++                },
++            );
++            y += rows;
++        }
++        Ok(())
++    }
+ }
+ 
+ /// Rows `y..y + rows` of an atlas of `height` rows whose first `static_rows`
+diff --git a/crates/horizon-client-render/src/hud.rs b/crates/horizon-client-render/src/hud.rs
+index 931ef90..21970b6 100644
+--- a/crates/horizon-client-render/src/hud.rs
++++ b/crates/horizon-client-render/src/hud.rs
+@@ -66,6 +66,10 @@ pub struct HudAtlas {
+     /// own (`gfx::shared_atlas`), so the static part can be compressed. A
+     /// multiple of the ASTC block.
+     pub static_rows: u32,
++    /// The content key of the static rows' pixels (`astc::content_key`): the
++    /// name of their ASTC bake (`astc::atlas_path`), read while the pixels are
++    /// still in memory.
++    pub static_key: u64,
+     pub sprites: HashMap<String, Rect>,
+     /// Resolved player-profile names and UUIDs for inline head components.
+     pub object_skins: HashMap<String, String>,
+@@ -548,6 +552,7 @@ impl HudAtlas {
+             rect(0, static_rows, width, glyph_top, width, text_rows),
+         );
+         let white = sprites["horizon/white"];
++        let static_key = crate::astc::content_key(&pixels[..(static_rows * width * 4) as usize]);
+         Self {
+             font: crate::font::Font::load(
+                 Path::new("horizon-boot"),
+@@ -561,6 +566,7 @@ impl HudAtlas {
+             width,
+             height,
+             static_rows,
++            static_key,
+             sprites,
+             translucent: HashSet::new(),
+             flags: HashMap::new(),
+@@ -889,11 +895,19 @@ impl HudAtlas {
+             (glyph_region, height - glyph_region),
+             white,
+         );
++        // The drawn atlas's static rows are final here: their key names their
++        // ASTC bake. The fonts-only atlas is never drawn.
++        let static_key = if full {
++            crate::astc::content_key(&pixels[..(static_rows * width * 4) as usize])
++        } else {
++            0
++        };
+         Ok(Self {
+             pixels,
+             width,
+             height,
+             static_rows,
++            static_key,
+             sprites,
+             object_skins: HashMap::new(),
+             translucent,
+@@ -2012,7 +2026,7 @@ impl HudRenderer {
+             let atlas = self.atlas.as_mut()?;
+             let mut encoder = device.create_command_encoder(&Default::default());
+             let view = atlas
+-                .combined(device, &mut encoder)
++                .combined(device, queue, &mut encoder)
+                 .create_view(&Default::default());
+             queue.submit([encoder.finish()]);
+             pack_text::PackText::new(device, self.format, &view, shader)
+diff --git a/crates/horizon-client/src/game.rs b/crates/horizon-client/src/game.rs
+index 00d9568..6186ebb 100644
+--- a/crates/horizon-client/src/game.rs
++++ b/crates/horizon-client/src/game.rs
+@@ -18713,7 +18713,13 @@ fn build_renderer(
+         assets.texture_layers,
+         &assets.sprite_mips,
+         &assets.animations,
+-        (&atlas.pixels, atlas.width, atlas.height, atlas.static_rows),
++        (
++            &atlas.pixels,
++            atlas.width,
++            atlas.height,
++            atlas.static_rows,
++            atlas.static_key,
++        ),
+         gui.atlas_file.as_deref(),
+         (&atlas.glint.0, atlas.glint.1, atlas.glint.2),
+         (
+@@ -18769,8 +18775,14 @@ fn loading_renderer(
+         pixels: [0u8; 4].repeat(6),
+     };
+     let panorama = panorama.unwrap_or(&empty_panorama);
+-    let (pixels, width, height, static_rows) = atlas.map_or((EMPTY_HUD.as_slice(), 1, 2, 1), |a| {
+-        (a.pixels.as_slice(), a.width, a.height, a.static_rows)
++    let hud_atlas = atlas.map_or((EMPTY_HUD.as_slice(), 1, 2, 1, 0), |a| {
++        (
++            a.pixels.as_slice(),
++            a.width,
++            a.height,
++            a.static_rows,
++            a.static_key,
++        )
+     });
+     let (glint_pixels, glint_width, glint_height) = atlas
+         .map_or((EMPTY_GLINT.as_slice(), 1, 1), |a| {
+@@ -18791,7 +18803,7 @@ fn loading_renderer(
+         1,
+         &[],
+         &[],
+-        (pixels, width, height, static_rows),
++        hud_atlas,
+         atlas_file,
+         (glint_pixels, glint_width, glint_height),
+         (glint_pixels, glint_width, glint_height),
+@@ -19640,19 +19652,41 @@ fn bake_atlas(options: &Options, vanilla_root: &std::path::Path) -> Result<()> {
+     );
+     let dir = std::env::current_dir()?.join("cache");
+     std::fs::create_dir_all(&dir)?;
+-    let path = dir.join(format!("hud-atlas-{}x{}.astc", atlas.width, atlas.height));
++    // Only the static rows: the rows below them are written while the game
++    // runs, which an ASTC texture cannot take (`gfx::shared_atlas`).
++    let rows = atlas.static_rows;
++    let path = horizon_client::astc::atlas_path(&dir, atlas.width, rows, atlas.static_key);
+     let started = Instant::now();
+-    horizon_client::astc::encode(&encoder, &atlas.pixels, atlas.width, atlas.height, &path)
+-        .map_err(|e| e.to_string())?;
++    let static_bytes = (atlas.width * rows * 4) as usize;
++    horizon_client::astc::encode(
++        &encoder,
++        &atlas.pixels[..static_bytes],
++        atlas.width,
++        rows,
++        &path,
++    )
++    .map_err(|e| e.to_string())?;
+     let bytes = std::fs::metadata(&path).map_or(0, |m| m.len());
+     log::info!(
+         "Horizon: baked {} ({} MiB, {:.1} bpp) with {} in {:.1} s",
+         path.display(),
+         bytes / (1024 * 1024),
+-        (bytes * 8) as f64 / (f64::from(atlas.width) * f64::from(atlas.height)),
++        (bytes * 8) as f64 / (f64::from(atlas.width) * f64::from(rows)),
+         encoder.display(),
+         started.elapsed().as_secs_f32()
+     );
++    // Earlier bakes of the atlas (other textures, or the whole atlas as
++    // builds before the split baked it) are never read again.
++    for entry in std::fs::read_dir(&dir)?.flatten() {
++        let name = entry.file_name();
++        let name = name.to_string_lossy();
++        if name.starts_with(horizon_client::astc::ATLAS_PREFIX)
++            && name.ends_with(".astc")
++            && entry.path() != path
++        {
++            let _ = std::fs::remove_file(entry.path());
++        }
++    }
+     println!("{}", path.display());
+     // The block sprite arrays, packed exactly as the renderer packs them at
+     // startup, so the renderer finds a bake that matches its bytes.
+-- 
+2.43.0
+

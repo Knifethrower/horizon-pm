@@ -1,0 +1,2699 @@
+From 26b06627866d4bd46d363db3031eb9583f2cf743 Mon Sep 17 00:00:00 2001
+From: SLAYKIN6_TTV <>
+Date: Sat, 7 Nov 2026 04:52:24 -0500
+Subject: [PATCH] port: the mcrust port's own changes, 0001-0028 in one patch
+
+The changes SLAYKIN6_TTV made to Horizon for the Minecraft Rust Edition port, as they were before this
+series (their patches 0001-0028, which had no 0006). Rebuilt here as one patch from the tree they sent:
+applied to 26747867d, it gives that tree exactly.
+---
+ Cargo.lock                                    |   1 +
+ crates/horizon-client-render/src/astc.rs      | 588 ++++++++++++++++++
+ crates/horizon-client-render/src/gfx.rs       | 475 +++++++++++++-
+ .../horizon-client-render/src/gfx/animate.rs  |  27 +-
+ crates/horizon-client-render/src/gfx/arena.rs |  13 +-
+ .../horizon-client-render/src/gfx/panorama.rs |  49 +-
+ crates/horizon-client-render/src/graphics.rs  |   6 +-
+ crates/horizon-client-render/src/hud.rs       |  45 +-
+ crates/horizon-client-render/src/lib.rs       |   1 +
+ crates/horizon-client-render/src/settings.rs  |  16 +-
+ crates/horizon-client-render/src/sprites.rs   |  69 +-
+ crates/horizon-client-render/src/terrain.wgsl |  13 +
+ crates/horizon-client/src/game.rs             | 403 +++++++++++-
+ .../horizon-client/src/game/no_resources.rs   |   2 +
+ crates/horizon-client/src/game/packs.rs       |   1 +
+ .../horizon-client/src/game/startup_menu.rs   |   1 +
+ crates/horizon-client/src/game/stations.rs    |  10 +-
+ crates/horizon-client/src/lib.rs              |   3 +-
+ crates/horizon-items/src/items.rs             |  39 +-
+ crates/horizon-world/Cargo.toml               |   1 +
+ .../horizon-world/src/worldgen/generator.rs   |   4 +
+ .../src/worldgen/generator_blocks.rs          |   1 +
+ 22 files changed, 1684 insertions(+), 84 deletions(-)
+ create mode 100644 crates/horizon-client-render/src/astc.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 60a9ea3..980d5ca 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1668,6 +1668,7 @@ version = "0.1.0"
+ dependencies = [
+  "flate2",
+  "horizon-core",
++ "horizon-threads",
+  "libm",
+  "lz4_flex",
+  "postcard",
+diff --git a/crates/horizon-client-render/src/astc.rs b/crates/horizon-client-render/src/astc.rs
+new file mode 100644
+index 0000000..4f4e4e2
+--- /dev/null
++++ b/crates/horizon-client-render/src/astc.rs
+@@ -0,0 +1,588 @@
++//! ASTC 4x4 for the textures Horizon assembles at run time.
++//!
++//! The shared atlas and the block sprite arrays are packed on the CPU from the
++//! resource pack; the GPU only samples them afterwards. Compressed, they take a
++//! quarter of the memory and a quarter of the bytes per sample, which is what a
++//! bandwidth-limited handheld notices: ASTC 4x4 is 8 bits per texel against
++//! `Rgba8Unorm`'s 32, and four times as many texels share a cache line.
++//!
++//! Compressing is a one-time job: `--bake-atlas` writes `cache/*.astc` beside
++//! the RGBA spills `patch.bash` already leaves there, and the renderer loads
++//! that file when this GPU samples ASTC. When it does not, or the file is
++//! missing or the wrong size, every caller falls back to the RGBA path.
++
++use std::io::Write as _;
++use std::path::{Path, PathBuf};
++
++/// The block a baked image is divided into.
++pub const BLOCK: u32 = 4;
++/// Bytes one block occupies in memory and on disk.
++pub const BLOCK_BYTES: u64 = 16;
++/// The 16-byte header `astcenc` puts in front of the blocks in a `.astc` file
++/// (magic `0x5CA1AB13`, block dimensions, image dimensions). wgpu uploads raw
++/// blocks, so a cache keeps only what follows it.
++const ASTC_MAGIC: [u8; 4] = [0x13, 0xAB, 0xA1, 0x5C];
++
++/// Bytes an ASTC 4x4 image of this size takes, blocks at the edges included.
++pub fn encoded_len(width: u32, height: u32) -> u64 {
++    u64::from(width.div_ceil(BLOCK)) * u64::from(height.div_ceil(BLOCK)) * BLOCK_BYTES
++}
++
++/// The format baked images upload as. Horizon's textures are linear
++/// (`Rgba8Unorm`), so the channel is `Unorm`, never `UnormSrgb`.
++pub fn format() -> wgpu::TextureFormat {
++    wgpu::TextureFormat::Astc {
++        block: wgpu::AstcBlock::B4x4,
++        channel: wgpu::AstcChannel::Unorm,
++    }
++}
++
++/// Whether this device can sample ASTC. The GL backend reports the feature
++/// from `GL_KHR_texture_compression_astc_ldr`, so this stays a capability
++/// check: no device or SoC names anywhere.
++pub fn supported(device: &wgpu::Device) -> bool {
++    device
++        .features()
++        .contains(wgpu::Features::TEXTURE_COMPRESSION_ASTC)
++}
++
++/// The baked file beside a spill: `hud-atlas-4096x5120.rgba` -> `.astc`.
++pub fn cache_path(rgba: &Path) -> PathBuf {
++    rgba.with_extension("astc")
++}
++
++/// The encoder to run: `tools/astcenc` beside the executable, or
++/// `HORIZON_ASTCENC`. `None` leaves the RGBA path in place.
++pub fn find_encoder() -> Option<PathBuf> {
++    if let Some(path) = std::env::var_os("HORIZON_ASTCENC") {
++        let path = PathBuf::from(path);
++        if path.is_file() {
++            return Some(path);
++        }
++    }
++    let exe = std::env::current_exe().ok()?;
++    let dir = exe.parent()?;
++    ["tools/astcenc", "astcenc"]
++        .into_iter()
++        .map(|name| dir.join(name))
++        .find(|path| path.is_file())
++}
++
++/// Upload a baked image as a texture, or `None` when the file is missing, the
++/// wrong size for this atlas, or unreadable. The file holds raw blocks (a bake
++/// from an older build may still carry `astcenc`'s 16-byte container header,
++/// which is skipped). Streams a band of block rows at a time so the transient
++/// copy stays a megabyte or two, as the RGBA path does.
++pub fn load(
++    device: &wgpu::Device,
++    queue: &wgpu::Queue,
++    rgba: &Path,
++    width: u32,
++    height: u32,
++    label: &str,
++) -> Option<wgpu::Texture> {
++    let path = cache_path(rgba);
++    let want = encoded_len(width, height);
++    if !supported(device) {
++        return None;
++    }
++    let mut file = std::io::BufReader::new(std::fs::File::open(&path).ok()?);
++    let len = std::fs::metadata(&path).ok()?.len();
++    if len == want + 16 {
++        // A bake from a build that kept `astcenc`'s container header: the
++        // blocks are the same, they just start sixteen bytes in.
++        let mut head = [0u8; 16];
++        std::io::Read::read_exact(&mut file, &mut head).ok()?;
++        if head[..4] != ASTC_MAGIC {
++            return None;
++        }
++    } else if len != want {
++        return None;
++    }
++    let texture = device.create_texture(&wgpu::TextureDescriptor {
++        label: Some(label),
++        size: wgpu::Extent3d {
++            width,
++            height,
++            depth_or_array_layers: 1,
++        },
++        mip_level_count: 1,
++        sample_count: 1,
++        dimension: wgpu::TextureDimension::D2,
++        format: format(),
++        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
++        view_formats: &[],
++    });
++    // A block row of a 4096-wide image is 16 KiB; sixteen of them is a
++    // quarter-megabyte, so even the largest atlas streams in a handful of
++    // writes without a full copy in memory.
++    let bytes_per_row = u64::from(width.div_ceil(BLOCK)) * BLOCK_BYTES;
++    let block_rows = (1 << 20) / bytes_per_row.max(1);
++    let rows_per_band = u32::try_from(block_rows).unwrap_or(1).max(1);
++    let mut band = Vec::new();
++    let mut block_row = 0u32;
++    let total_rows = height.div_ceil(BLOCK);
++    while block_row < total_rows {
++        let rows = rows_per_band.min(total_rows - block_row);
++        let len = (u64::from(rows) * bytes_per_row) as usize;
++        band.resize(len, 0);
++        std::io::Read::read_exact(&mut file, &mut band).ok()?;
++        queue.write_texture(
++            wgpu::TexelCopyTextureInfo {
++                texture: &texture,
++                mip_level: 0,
++                origin: wgpu::Origin3d {
++                    x: 0,
++                    y: block_row * BLOCK,
++                    z: 0,
++                },
++                aspect: wgpu::TextureAspect::All,
++            },
++            &band,
++            wgpu::TexelCopyBufferLayout {
++                offset: 0,
++                bytes_per_row: Some(bytes_per_row as u32),
++                rows_per_image: Some(rows),
++            },
++            wgpu::Extent3d {
++                width,
++                height: rows * BLOCK,
++                depth_or_array_layers: 1,
++            },
++        );
++        block_row += rows;
++    }
++    Some(texture)
++}
++
++/// Write `raw` (`Rgba8Unorm`, top row first) as the TGA the encoder reads.
++/// ASTC's encoder takes image files, not the raw plane the game keeps; a TGA
++/// carries RGBA behind an 18-byte header. Streamed a band at a time, so an
++/// 80 MiB atlas never costs a second copy of itself to convert.
++pub fn write_tga(raw: &[u8], width: u32, height: u32, path: &Path) -> std::io::Result<()> {
++    // A TGA header stores both dimensions in 16 bits; a taller image would
++    // be written truncated and the encoder would read the wrong picture.
++    if width > u32::from(u16::MAX) || height > u32::from(u16::MAX) {
++        return Err(std::io::Error::new(
++            std::io::ErrorKind::InvalidInput,
++            format!("{width}x{height} does not fit a TGA header"),
++        ));
++    }
++    let mut out = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(path)?);
++    let mut header = [0u8; 18];
++    header[2] = 2; // uncompressed true colour, no colour map
++    header[12..14].copy_from_slice(&(width as u16).to_le_bytes());
++    header[14..16].copy_from_slice(&(height as u16).to_le_bytes());
++    header[16] = 32; // bits per pixel
++    header[17] = 0x28; // 8 alpha bits, top row first
++    out.write_all(&header)?;
++    const BAND: usize = 1 << 20; // a multiple of four
++    let mut band = vec![0u8; BAND];
++    for chunk in raw.chunks(BAND) {
++        let len = chunk.len() & !3;
++        band[..len].copy_from_slice(&chunk[..len]);
++        // TGA stores BGRA; the atlas is RGBA.
++        for texel in band[..len].chunks_exact_mut(4) {
++            texel.swap(0, 2);
++        }
++        out.write_all(&band[..len])?;
++    }
++    out.flush()
++}
++
++/// Compress `raw` to `out` with the encoder at `encoder`. Writes through a
++/// temporary file and renames, so a half-written cache is never loaded.
++pub fn encode(
++    encoder: &Path,
++    raw: &[u8],
++    width: u32,
++    height: u32,
++    out: &Path,
++) -> Result<(), String> {
++    let tga = out.with_extension("tga");
++    write_tga(raw, width, height, &tga).map_err(|e| format!("{}: {e}", tga.display()))?;
++    // The encoder picks the output format from the file name, and `.astc.tmp`
++    // reads as an unknown type ("Unknown compressed output file type '.tmp'"):
++    // the temporary keeps `.astc` as its extension and a `tmp` step before it.
++    let tmp = out.with_extension("tmp.astc");
++    let status = std::process::Command::new(encoder)
++        .arg("-cl")
++        .arg(&tga)
++        .arg(&tmp)
++        .arg("4x4")
++        .arg("-medium")
++        .status()
++        .map_err(|e| format!("could not run {}: {e}", encoder.display()))?;
++    let _ = std::fs::remove_file(&tga);
++    if !status.success() {
++        let _ = std::fs::remove_file(&tmp);
++        return Err(format!("{} exited with {status}", encoder.display()));
++    }
++    // Keep the blocks and drop `astcenc`'s own container header: `load` checks
++    // the cache against `encoded_len`, which counts blocks.
++    let mut raw = std::io::BufReader::new(
++        std::fs::File::open(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?,
++    );
++    let mut head = [0u8; 16];
++    let headed = std::io::Read::read_exact(&mut raw, &mut head).is_ok() && head[..4] == ASTC_MAGIC;
++    if !headed {
++        std::io::Seek::seek(&mut raw, std::io::SeekFrom::Start(0))
++            .map_err(|e| format!("{}: {e}", tmp.display()))?;
++    }
++    let mut cache = std::io::BufWriter::new(
++        std::fs::File::create(out).map_err(|e| format!("{}: {e}", out.display()))?,
++    );
++    std::io::copy(&mut raw, &mut cache).map_err(|e| format!("{}: {e}", out.display()))?;
++    std::io::Write::flush(&mut cache).map_err(|e| format!("{}: {e}", out.display()))?;
++    drop(cache);
++    let _ = std::fs::remove_file(&tmp);
++    Ok(())
++}
++
++/// The key of packed sprite arrays, over their top-level pixels only.
++///
++/// Every other level is derived from those pixels, so a chain built with fewer
++/// mip levels hashes like one built with more: the player's Mipmap Levels
++/// option decides how many levels a run builds, and must not decide which bake
++/// it can use. `chains` is `(layer-major chain, its level count)`, one per
++/// array, in layer order.
++pub fn pack_key<'a>(size: u32, chains: impl IntoIterator<Item = (&'a [u8], u32)>) -> u64 {
++    let top = (size * size * 4) as usize;
++    let mut parts: Vec<&[u8]> = Vec::new();
++    for (bytes, levels) in chains {
++        let chain: usize = (0..levels)
++            .map(|level| {
++                let edge = (size >> level).max(1);
++                (edge * edge * 4) as usize
++            })
++            .sum();
++        if chain == 0 || bytes.len() < top {
++            continue;
++        }
++        for layer in 0..bytes.len() / chain {
++            let start = layer * chain;
++            parts.push(&bytes[start..start + top]);
++        }
++    }
++    content_key_parts(parts)
++}
++
++/// A cache key for a packed array: the same bytes always give the same key,
++/// so a cache baked from other resources is never mistaken for this one.
++pub fn content_key(bytes: &[u8]) -> u64 {
++    content_key_parts(std::iter::once(bytes))
++}
++
++/// [`content_key`] of several slices read as one. A pack cut into arrays for a
++/// smaller adapter hashes like the one chain the bake had, because a chain is a
++/// whole number of eight-byte words per layer.
++pub fn content_key_parts<'a>(parts: impl IntoIterator<Item = &'a [u8]>) -> u64 {
++    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
++    let mut word = |bytes: &[u8]| {
++        for chunk in bytes.chunks_exact(8) {
++            hash ^= u64::from_le_bytes(chunk.try_into().unwrap_or([0; 8]));
++            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
++        }
++        for &byte in bytes.chunks_exact(8).remainder() {
++            hash ^= u64::from(byte);
++            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
++        }
++    };
++    for part in parts {
++        word(part);
++    }
++    hash
++}
++
++/// The most mip levels a baked array of `size` pixels can hold: the chain down
++/// to a single block, which is also the narrowest level a texture copy and an
++/// ASTC texture can express. The bake builds this many whatever the Mipmap
++/// Levels option says, so one bake serves every value of it.
++pub fn max_levels(size: u32) -> u32 {
++    size.ilog2().saturating_sub(BLOCK.ilog2()) + 1
++}
++
++/// The baked file of one packed sprite array.
++/// The bake has no adapter, so it writes every layer into one file; the
++/// renderer reads each of its arrays out of that file by layer range.
++pub fn array_path(dir: &Path, size: u32, layers: u32, levels: u32, key: u64) -> PathBuf {
++    dir.join(format!(
++        "sprites-{size}-{layers}l-{levels}m-{key:016x}.astc"
++    ))
++}
++
++/// The bake of this pack in `dir`, of any level count. A mip chain is a
++/// prefix, so a bake with more levels than wanted serves a request for fewer:
++/// the level count is the player's Mipmap Levels option and changes between
++/// bakes and runs, which must not decide whether a bake is found at all.
++/// The most levels wins when several match.
++pub fn find_array(dir: &Path, size: u32, layers: u32, key: u64) -> Option<PathBuf> {
++    let prefix = format!("sprites-{size}-{layers}l-");
++    let suffix = format!("-{key:016x}.astc");
++    let mut best: Option<(u32, PathBuf)> = None;
++    for entry in std::fs::read_dir(dir).ok()?.flatten() {
++        let name = entry.file_name();
++        let Some(rest) = name.to_str().and_then(|name| name.strip_prefix(&prefix)) else {
++            continue;
++        };
++        let Some(levels) = rest
++            .strip_suffix(&suffix)
++            .and_then(|levels| levels.strip_suffix('m'))
++            .and_then(|levels| levels.parse::<u32>().ok())
++        else {
++            continue;
++        };
++        if best.as_ref().is_none_or(|(have, _)| levels > *have) {
++            best = Some((levels, entry.path()));
++        }
++    }
++    best.map(|(_, path)| path)
++}
++
++/// Bytes a packed array's baked file takes: a 16-byte header (`HZS1`, edge,
++/// layers, levels) and every level's blocks, layers one after another.
++pub fn array_len(size: u32, layers: u32, levels: u32) -> u64 {
++    let mut total = 16;
++    for level in 0..levels {
++        let edge = (size >> level).max(1);
++        total += encoded_len(edge, edge) * u64::from(layers);
++    }
++    total
++}
++
++/// Upload a baked sprite array, or `None` when the file is missing, of the
++/// wrong size, or this device cannot sample ASTC. `layers` is what the file
++/// holds; a texture with more layers gets zeroed ones (the packed arrays pad
++/// their layer count for OpenGL).
++pub fn load_array(
++    device: &wgpu::Device,
++    queue: &wgpu::Queue,
++    path: &Path,
++    size: u32,
++    first_layer: u32,
++    layers: u32,
++    texture_layers: u32,
++    levels: u32,
++    label: &str,
++) -> Option<wgpu::Texture> {
++    if !supported(device) {
++        return None;
++    }
++    let mut file = std::io::BufReader::new(std::fs::File::open(path).ok()?);
++    let mut header = [0u8; 16];
++    std::io::Read::read_exact(&mut file, &mut header).ok()?;
++    let u32_at = |at: usize| u32::from_le_bytes(header[at..at + 4].try_into().unwrap_or([0; 4]));
++    let total = u32_at(8);
++    let baked = u32_at(12);
++    // More levels than asked for is fine: the chain is a prefix, and the
++    // player's Mipmap Levels option picks how many of them are sampled.
++    if &header[0..4] != b"HZS1" || u32_at(4) != size || baked < levels {
++        return None;
++    }
++    // wgpu copies whole blocks: a level narrower than one block cannot upload.
++    if (size >> (levels - 1)).max(1) < BLOCK {
++        return None;
++    }
++    if layers > texture_layers
++        || first_layer.checked_add(layers)? > total
++        || std::fs::metadata(path).ok()?.len() != array_len(size, total, baked)
++    {
++        return None;
++    }
++    let texture = device.create_texture(&wgpu::TextureDescriptor {
++        label: Some(label),
++        size: wgpu::Extent3d {
++            width: size,
++            height: size,
++            depth_or_array_layers: texture_layers,
++        },
++        mip_level_count: levels,
++        sample_count: 1,
++        dimension: wgpu::TextureDimension::D2,
++        format: format(),
++        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
++        view_formats: &[],
++    });
++    for level in 0..levels {
++        let edge = (size >> level).max(1);
++        let blocks = edge.div_ceil(BLOCK);
++        let row_bytes = blocks * BLOCK_BYTES as u32;
++        // A level holds every layer, one after another, so this array's range
++        // is a seek in and a seek out.
++        let layer_bytes = u64::from(blocks) * u64::from(row_bytes);
++        let skip_in = u64::from(first_layer) * layer_bytes;
++        let skip_out = u64::from(total - first_layer - layers) * layer_bytes;
++        if std::io::Seek::seek(&mut file, std::io::SeekFrom::Current(skip_in as i64)).is_err() {
++            return None;
++        }
++        let len = layer_bytes * u64::from(layers);
++        let mut data = vec![0u8; len as usize];
++        std::io::Read::read_exact(&mut file, &mut data).ok()?;
++        // `write_texture` wants a 256-byte row pitch; the narrow levels pad
++        // theirs, and each layer still holds `blocks` rows.
++        let pitch = row_bytes.next_multiple_of(256);
++        let padded;
++        let (bytes, pitch) = if pitch == row_bytes {
++            (&data[..], row_bytes)
++        } else {
++            let mut out = vec![0u8; (pitch * blocks * layers) as usize];
++            for layer in 0..layers as usize {
++                for row in 0..blocks as usize {
++                    let src = ((layer * blocks as usize + row) * row_bytes as usize) as usize;
++                    let dst = ((layer * blocks as usize + row) * pitch as usize) as usize;
++                    out[dst..dst + row_bytes as usize]
++                        .copy_from_slice(&data[src..src + row_bytes as usize]);
++                }
++            }
++            padded = out;
++            (&padded[..], pitch)
++        };
++        let write = |texture: &wgpu::Texture, origin_z: u32, layers: u32, bytes: &[u8], pitch: u32| {
++            queue.write_texture(
++                wgpu::TexelCopyTextureInfo {
++                    texture,
++                    mip_level: level,
++                    origin: wgpu::Origin3d {
++                        x: 0,
++                        y: 0,
++                        z: origin_z,
++                    },
++                    aspect: wgpu::TextureAspect::All,
++                },
++                bytes,
++                wgpu::TexelCopyBufferLayout {
++                    offset: 0,
++                    bytes_per_row: Some(pitch),
++                    rows_per_image: Some(blocks),
++                },
++                wgpu::Extent3d {
++                    width: edge,
++                    height: edge,
++                    depth_or_array_layers: layers,
++                },
++            );
++        };
++        if std::io::Seek::seek(&mut file, std::io::SeekFrom::Current(skip_out as i64)).is_err() {
++            return None;
++        }
++        write(&texture, 0, layers, bytes, pitch);
++        let extra = texture_layers - layers;
++        if extra > 0 {
++            // Never sampled: the packed layer count OpenGL pads.
++            let zero = vec![0u8; (pitch * blocks) as usize];
++            for layer in 0..extra {
++                write(&texture, layers + layer, 1, &zero, pitch);
++            }
++        }
++    }
++    Some(texture)
++}
++
++/// Compress a packed sprite array (`PreparedTextures`' layer-major mip chain)
++/// into the file `load_array` reads. One tall image per level, so a 1291-layer
++/// pack costs four encoder runs per array rather than one per layer.
++pub fn encode_array(
++    encoder: &Path,
++    bytes: &[u8],
++    size: u32,
++    layers: u32,
++    levels: u32,
++    out: &Path,
++) -> Result<(), String> {
++    let chain: usize = (0..levels)
++        .map(|level| {
++            let edge = (size >> level).max(1) as usize;
++            edge * edge * 4
++        })
++        .sum();
++    if bytes.len() != chain * layers as usize {
++        return Err(format!(
++            "{}: {} bytes for {layers} layers of {size}px at {levels} levels",
++            out.display(),
++            bytes.len()
++        ));
++    }
++    let tmp = out.with_extension("tmp.astc");
++    {
++        let mut file = std::io::BufWriter::new(
++            std::fs::File::create(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?,
++        );
++        let mut head = Vec::with_capacity(16);
++        head.extend_from_slice(b"HZS1");
++        head.extend_from_slice(&size.to_le_bytes());
++        head.extend_from_slice(&layers.to_le_bytes());
++        head.extend_from_slice(&levels.to_le_bytes());
++        file.write_all(&head)
++            .map_err(|e| format!("{}: {e}", tmp.display()))?;
++        let tga = out.with_extension("tga");
++        let level_astc = out.with_extension("level.astc");
++        for level in 0..levels {
++            let edge = (size >> level).max(1);
++            let layer_len = (edge * edge * 4) as usize;
++            let offset: usize = (0..level)
++                .map(|level| {
++                    let edge = (size >> level).max(1) as usize;
++                    edge * edge * 4
++                })
++                .sum();
++            // A level is one tall image, `edge` wide and `edge * layers` high,
++            // and a TGA's header holds 16-bit dimensions: 1291 layers of 64 px
++            // is 82,624, past the 65,535 it can say, and the file went out
++            // truncated (the encoder saw 17,088 px). Encode in runs that fit;
++            // their blocks concatenate, a layer being `encoded_len` bytes in
++            // every run.
++            let per_run = (u16::MAX as u32 / edge).max(1) as usize;
++            let mut first = 0;
++            while first < layers as usize {
++                let count = per_run.min(layers as usize - first);
++                let mut image = Vec::with_capacity(layer_len * count);
++                for layer in first..first + count {
++                    let at = layer * chain + offset;
++                    image.extend_from_slice(&bytes[at..at + layer_len]);
++                }
++                write_tga(&image, edge, edge * count as u32, &tga)
++                    .map_err(|e| format!("{}: {e}", tga.display()))?;
++                drop(image);
++                let status = std::process::Command::new(encoder)
++                    .arg("-cl")
++                    .arg(&tga)
++                    .arg(&level_astc)
++                    .arg("4x4")
++                    .arg("-medium")
++                    .status()
++                    .map_err(|e| format!("could not run {}: {e}", encoder.display()))?;
++                if !status.success() {
++                    let _ = std::fs::remove_file(&tga);
++                    let _ = std::fs::remove_file(&level_astc);
++                    let _ = std::fs::remove_file(&tmp);
++                    return Err(format!("{} exited with {status}", encoder.display()));
++                }
++                let mut blocks = std::fs::read(&level_astc)
++                    .map_err(|e| format!("{}: {e}", level_astc.display()))?;
++                // `astcenc` puts its container header in front of the blocks;
++                // the container this writes holds blocks only.
++                if blocks.len() >= 16 && blocks[..4] == ASTC_MAGIC {
++                    blocks.drain(..16);
++                }
++                let want = encoded_len(edge, edge) * count as u64;
++                if blocks.len() as u64 != want {
++                    let _ = std::fs::remove_file(&tga);
++                    let _ = std::fs::remove_file(&level_astc);
++                    let _ = std::fs::remove_file(&tmp);
++                    return Err(format!(
++                        "{}: {} bytes of blocks, expected {want} for {count} layers",
++                        level_astc.display(),
++                        blocks.len()
++                    ));
++                }
++                file.write_all(&blocks)
++                    .map_err(|e| format!("{}: {e}", tmp.display()))?;
++                first += count;
++            }
++        }
++        let _ = std::fs::remove_file(&tga);
++        let _ = std::fs::remove_file(&level_astc);
++        file.flush().map_err(|e| format!("{}: {e}", tmp.display()))?;
++    }
++    std::fs::rename(&tmp, out).map_err(|e| format!("{}: {e}", out.display()))
++}
+diff --git a/crates/horizon-client-render/src/gfx.rs b/crates/horizon-client-render/src/gfx.rs
+index 0bddc1f..29b0efb 100644
+--- a/crates/horizon-client-render/src/gfx.rs
++++ b/crates/horizon-client-render/src/gfx.rs
+@@ -3,6 +3,7 @@
+ //! world coordinates keep full precision.
+ use crate::{
+     Result,
++    astc,
+     environment::Sky,
+     graphics::GraphicsApi,
+     hud::{HudBatch, HudRenderer},
+@@ -615,6 +616,16 @@ pub struct Renderer {
+     sprite_split: u32,
+     /// A 1-layer array bound where a pack needs fewer arrays.
+     sprite_unused: wgpu::TextureView,
++    /// The animated block sprites, in an array of their own: their layers are
++    /// rewritten every tick, and a compressed texture cannot be written, so
++    /// they stay out of `sprite_textures` (which can then be ASTC).
++    animated_view: wgpu::TextureView,
++    /// Block sprite layer -> its layer in `animated_sprites`, or `u32::MAX`
++    /// (a `R32Uint` texel per layer, read with `textureLoad`).
++    sprite_layers: wgpu::TextureView,
++    /// Whether the block sprite arrays are ASTC (no shader pack atlas then:
++    /// its copy would be compressed to uncompressed).
++    sprite_astc: bool,
+     mip_levels: u32,
+     /// The mipmap levels sampled (the Mipmap Levels option), at most `mip_levels - 1`.
+     mipmaps: u32,
+@@ -883,6 +894,8 @@ fn terrain_group(
+     lightmap: &wgpu::TextureView,
+     lightmap_sampler: &wgpu::Sampler,
+     emission_thresholds: &wgpu::TextureView,
++    animated: &wgpu::TextureView,
++    layer_map: &wgpu::TextureView,
+ ) -> wgpu::BindGroup {
+     let view = |binding, view| wgpu::BindGroupEntry {
+         binding,
+@@ -914,6 +927,8 @@ fn terrain_group(
+             view(10, &sprites[6]),
+             view(11, &sprites[7]),
+             view(12, emission_thresholds),
++            view(13, layer_map),
++            view(14, animated),
+         ],
+     })
+ }
+@@ -923,6 +938,8 @@ pub struct PreparedTextures {
+     sprites: Vec<(Vec<u8>, u32)>,
+     /// The sprite layers per array `sprites` is cut by.
+     split: u32,
++    /// The sprite arrays' edge in pixels.
++    size: u32,
+     forcefield: (Vec<u8>, u32),
+ }
+ impl PreparedTextures {
+@@ -955,6 +972,7 @@ impl PreparedTextures {
+                 })
+                 .collect(),
+             split,
++            size,
+             forcefield: mip_chain(forcefield.0, forcefield.1, &[], 0, 1),
+         }
+     }
+@@ -981,6 +999,21 @@ impl PreparedTextures {
+         self.split = split;
+         self
+     }
++
++    /// Each packed sprite array, for baking its ASTC cache: `(array, edge,
++    /// layers, mip levels, the layer-major mip chain)`.
++    pub fn arrays(&self) -> impl Iterator<Item = (usize, u32, u32, u32, &[u8])> {
++        self.sprites.iter().enumerate().map(move |(array, (bytes, levels))| {
++            let chain: usize = (0..*levels)
++                .map(|level| {
++                    let edge = (self.size >> level).max(1) as usize;
++                    edge * edge * 4
++                })
++                .sum();
++            let layers = u32::try_from(bytes.len() / chain.max(1)).unwrap_or(1);
++            (array, self.size, layers, *levels, bytes.as_slice())
++        })
++    }
+ }
+ 
+ fn mip_chain(
+@@ -990,8 +1023,27 @@ fn mip_chain(
+     first: u32,
+     layers: u32,
+ ) -> (Vec<u8>, u32) {
+-    let levels = size.trailing_zeros() + 1;
++    // `HORIZON_SPRITE_MIPS` caps the levels a sprite array is built with (dev
++    // only): a driver that pads every layer's every level can spend tens of
++    // MiB on an array whose pixels are one MiB.
++    let levels = (size.trailing_zeros() + 1)
++        .min(crate::sprites::mip_cap())
++        .max(1);
+     let layer_bytes = (size * size * 4) as usize;
++    // A pack read for a server hands over no pixels: pad to the layers asked
++    // for instead of slicing past the end of an empty buffer.
++    let needed = layer_bytes * layers as usize;
++    let padded;
++    let pixels = if pixels.len() < needed {
++        padded = {
++            let mut bytes = pixels.to_vec();
++            bytes.resize(needed, 0);
++            bytes
++        };
++        &padded[..]
++    } else {
++        pixels
++    };
+     // Exactly the chain's size: cached animation frames count their capacity.
+     let chain_bytes: usize = (0..levels).map(|l| layer_bytes >> (2 * l)).sum();
+     let mut out = Vec::with_capacity(chain_bytes * layers as usize);
+@@ -1023,6 +1075,14 @@ fn mip_chain(
+     debug_assert_eq!(out.len(), chain_bytes * layers as usize);
+     (out, levels)
+ }
++/// The process's resident set in MiB, for logs written while memory matters.
++fn rss_mib_for_log() -> u64 {
++    std::fs::read_to_string("/proc/self/statm")
++        .ok()
++        .and_then(|s| s.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok()))
++        .map(|pages| pages * 4 / 1024)
++        .unwrap_or(0)
++}
+ /// The wgpu instance options, without wgpu's validation of indirect draws
+ /// in release builds. That validation (meant for untrusted WebGPU content)
+ /// copies every indirect draw through a compute pass before the render pass
+@@ -1334,7 +1394,9 @@ async fn open_backend(
+     // targets with the adapter's own format features) and R11F_G11F_B10F: a float
+     // stand-in neither clamps nor drops NaN. Subgroups: shader packs' compute programs
+     // (`MC_GL_KHR_shader_subgroup_*`); storage buffers in vertex shaders, clearing and
+-    // atomics on images: their buffers and images.
++    // atomics on images: their buffers and images. ASTC: sampling the baked texture caches
++    // this adapter can read (see `astc`); masked by `adapter.features()`, so a GPU without
++    // it simply keeps the RGBA textures.
+     let features = timing::GpuTimer::features(&adapter)
+         | cull::Cull::features(&adapter)
+         | oit::features(&adapter)
+@@ -1344,6 +1406,7 @@ async fn open_backend(
+                 | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
+                 | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
+                 | wgpu::Features::RG11B10UFLOAT_RENDERABLE
++                | wgpu::Features::TEXTURE_COMPRESSION_ASTC
+                 | wgpu::Features::SUBGROUP
+                 | wgpu::Features::VERTEX_WRITABLE_STORAGE
+                 | wgpu::Features::CLEAR_TEXTURE
+@@ -1482,6 +1545,7 @@ impl Renderer {
+         sprite_mips: &[crate::mipmap::Settings],
+         animations: &[SpriteAnimation],
+         hud_atlas: (&[u8], u32, u32),
++        hud_atlas_file: Option<&std::path::Path>,
+         glint: (&[u8], u32, u32),
+         glint_armor: (&[u8], u32, u32),
+         forcefield: (&[u8], u32),
+@@ -1680,6 +1744,18 @@ impl Renderer {
+                         multisampled: false,
+                     },
+                 ),
++                // terrain.wgsl's `layer_map`: which layer of the animated array
++                // a block sprite has, or `u32::MAX` when it does not animate.
++                entry(
++                    13,
++                    vf,
++                    wgpu::BindingType::Texture {
++                        sample_type: wgpu::TextureSampleType::Uint,
++                        view_dimension: wgpu::TextureViewDimension::D2,
++                        multisampled: false,
++                    },
++                ),
++                entry(14, vf, sprite_array),
+             ],
+         });
+         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+@@ -1922,7 +1998,39 @@ impl Renderer {
+             ),
+         };
+         let mut mip_levels = 1;
++        let sprite_levels = prepared.sprites.first().map_or(1, |(_, levels)| *levels);
+         let gl = adapter.get_info().backend == wgpu::Backend::Gl;
++        // The cache dir the atlas spill lives in, for a baked ASTC array.
++        let cache_dir = hud_atlas_file.and_then(|path| path.parent());
++        // The bake has no adapter, so it wrote every layer into one file. The
++        // key is therefore the whole pack's, whether this adapter cut it into
++        // one array or six.
++        let baked_key = cache_dir.map(|_| {
++            astc::pack_key(
++                sprite_size,
++                prepared
++                    .sprites
++                    .iter()
++                    .map(|(mips, levels)| (mips.as_slice(), *levels)),
++            )
++        });
++        // The animated layers get an array of their own (below): they are the
++        // only layers the animator rewrites every tick, and a compressed
++        // texture cannot be written, so keeping them apart lets
++        // `sprite_textures` be ASTC. Their first frame must therefore come
++        // from the CPU pixels read here: a texture copy off the sprite arrays
++        // needs the two formats to match, and those arrays may be ASTC.
++        let mut animated_layers: Vec<u32> = animations
++            .iter()
++            .map(|animation| animation.layer)
++            .filter(|&layer| layer < layers)
++            .collect();
++        animated_layers.sort_unstable();
++        animated_layers.dedup();
++        // One layer-major chain per animated layer, in `animated_layers`
++        // order; `None` when this pack has no pixels for it.
++        let mut animated_pixels: Vec<Option<Vec<u8>>> = vec![None; animated_layers.len()];
++        let mut sprite_astc = true;
+         let sprite_textures: Vec<wgpu::Texture> = prepared
+             .sprites
+             .into_iter()
+@@ -1931,10 +2039,63 @@ impl Renderer {
+                 let first = array as u32 * split;
+                 let used = layers.saturating_sub(first).clamp(1, split);
+                 let count = array_layers(used, gl);
++                mip_levels = levels;
++                // The levels of one layer are contiguous (layer major).
++                if !mips.is_empty() {
++                    let chain = mips.len() / used as usize;
++                    for (dense, &layer) in animated_layers.iter().enumerate() {
++                        if (first..first + used).contains(&layer) {
++                            let start = (layer - first) as usize * chain;
++                            animated_pixels[dense] = Some(mips[start..start + chain].to_vec());
++                        }
++                    }
++                }
++                // The baked copy of this pack, when the bake is there.
++                let baked = cache_dir.zip(baked_key).and_then(|(dir, key)| {
++                    let path = astc::find_array(dir, sprite_size, layers, key)?;
++                    let texture = astc::load_array(
++                        &device,
++                        &queue,
++                        &path,
++                        sprite_size,
++                        first,
++                        used,
++                        count,
++                        levels,
++                        "Block sprites (ASTC)",
++                    )?;
++                    log::info!(
++                        "Horizon: block sprite array {array} ({count} layers at {sprite_size}px, \
++                         {levels} mip levels) loaded from its ASTC bake, {} MiB, rss {} MiB",
++                        ((0..levels)
++                            .map(|level| {
++                                let edge = (sprite_size >> level).max(1);
++                                astc::encoded_len(edge, edge)
++                            })
++                            .sum::<u64>()
++                            * u64::from(count))
++                            / (1024 * 1024),
++                        rss_mib_for_log()
++                    );
++                    Some(texture)
++                });
++                if let Some(texture) = baked {
++                    return texture;
++                }
++                sprite_astc = false;
++                log::info!(
++                    "Horizon: block sprite array {array}: no usable ASTC bake for {sprite_size}px \
++                     at {levels} mip levels, uploading RGBA instead"
++                );
+                 // The extra layers are empty.
+                 mips.resize(mips.len() / used as usize * count as usize, 0);
+-                mip_levels = levels;
+-                device.create_texture_with_data(
++                log::info!(
++                    "Horizon: block sprite array {array}: {count} layers at {sprite_size}px, \
++                     {levels} mip levels, {} MiB, rss {} MiB",
++                    mips.len() / (1024 * 1024),
++                    rss_mib_for_log()
++                );
++                let texture = device.create_texture_with_data(
+                     &queue,
+                     &wgpu::TextureDescriptor {
+                         label: Some("Block sprites"),
+@@ -1956,18 +2117,117 @@ impl Renderer {
+                     },
+                     wgpu::util::TextureDataOrder::LayerMajor,
+                     &mips,
+-                )
++                );
++                log::info!(
++                    "Horizon: block sprite array {array} uploaded, rss {} MiB",
++                    rss_mib_for_log()
++                );
++                texture
+             })
+             .collect();
++        let mut layer_map = vec![u32::MAX; layers as usize];
++        for (dense, &layer) in animated_layers.iter().enumerate() {
++            layer_map[layer as usize] = dense as u32;
++        }
++        let animated_count = u32::try_from(animated_layers.len())?.max(1);
++        // The first frame comes from the pixels read above, so a sprite starts
++        // on its first frame rather than on nothing. One layer-major buffer:
++        // a layer's levels, then the next layer's.
++        let chain: usize = (0..sprite_levels)
++            .map(|level| {
++                let edge = (sprite_size >> level).max(1);
++                (edge * edge * 4) as usize
++            })
++            .sum();
++        let mut animated_data = vec![0u8; chain * animated_count as usize];
++        for (dense, pixels) in animated_pixels.iter().enumerate() {
++            if let Some(pixels) = pixels {
++                let start = dense * chain;
++                let len = pixels.len().min(chain);
++                animated_data[start..start + len].copy_from_slice(&pixels[..len]);
++            }
++        }
++        let animated_sprites = device.create_texture_with_data(
++            &queue,
++            &wgpu::TextureDescriptor {
++                label: Some("Animated block sprites"),
++                size: wgpu::Extent3d {
++                    width: sprite_size,
++                    height: sprite_size,
++                    depth_or_array_layers: animated_count,
++                },
++                mip_level_count: sprite_levels,
++                sample_count: 1,
++                dimension: wgpu::TextureDimension::D2,
++                format: wgpu::TextureFormat::Rgba8Unorm,
++                usage: wgpu::TextureUsages::TEXTURE_BINDING
++                    | wgpu::TextureUsages::COPY_DST
++                    | wgpu::TextureUsages::COPY_SRC
++                    | wgpu::TextureUsages::STORAGE_BINDING,
++                view_formats: &[],
++            },
++            wgpu::util::TextureDataOrder::LayerMajor,
++            &animated_data,
++        );
++        log::info!(
++            "Horizon: {animated_count} animated sprite layers in their own array, rss {} MiB",
++            rss_mib_for_log()
++        );
++        // A texel per layer, read with `textureLoad`: a texture binds on every
++        // GLES 3.1 driver, where a fragment shader's storage buffers may not.
++        let map_width = (layers.max(1)).next_multiple_of(64);
++        layer_map.resize(map_width as usize, u32::MAX);
++        let sprite_layers = device.create_texture(&wgpu::TextureDescriptor {
++            label: Some("Block sprite layers"),
++            size: wgpu::Extent3d {
++                width: map_width,
++                height: 1,
++                depth_or_array_layers: 1,
++            },
++            mip_level_count: 1,
++            sample_count: 1,
++            dimension: wgpu::TextureDimension::D2,
++            format: wgpu::TextureFormat::R32Uint,
++            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
++            view_formats: &[],
++        });
++        queue.write_texture(
++            wgpu::TexelCopyTextureInfo {
++                texture: &sprite_layers,
++                mip_level: 0,
++                origin: wgpu::Origin3d::ZERO,
++                aspect: wgpu::TextureAspect::All,
++            },
++            bytemuck::cast_slice(&layer_map),
++            wgpu::TexelCopyBufferLayout {
++                offset: 0,
++                bytes_per_row: Some(map_width * 4),
++                rows_per_image: Some(1),
++            },
++            wgpu::Extent3d {
++                width: map_width,
++                height: 1,
++                depth_or_array_layers: 1,
++            },
++        );
++        let sprite_layers = sprite_layers.create_view(&Default::default());
++        let animated_view = animated_sprites.create_view(&wgpu::TextureViewDescriptor {
++            dimension: Some(wgpu::TextureViewDimension::D2Array),
++            ..Default::default()
++        });
+         let animations = animate::SpriteAnimator::new(
+             &device,
+             animations,
+             sprite_size,
+             sprite_mips,
+-            &sprite_textures,
+-            split,
++            &animated_sprites,
++            &layer_map,
+             animate::SpriteAnimator::compute(&adapter, &device),
+         );
++        log::info!(
++            "Horizon: sprite animator ready, rss {} MiB",
++            rss_mib_for_log()
++        );
+         let active_layer_words = animations.active_layer_words();
+         let sprite_unused = device
+             .create_texture(&wgpu::TextureDescriptor {
+@@ -2023,6 +2283,8 @@ impl Renderer {
+             &lightmap_view,
+             &lightmap_sampler,
+             &emission_stats.view,
++            &animated_view,
++            &sprite_layers,
+         );
+         let crosshair_group = terrain_group(
+             &device,
+@@ -2034,6 +2296,8 @@ impl Renderer {
+             &lightmap_view,
+             &lightmap_sampler,
+             &emission_stats.view,
++            &animated_view,
++            &sprite_layers,
+         );
+         let mirror_group = terrain_group(
+             &device,
+@@ -2045,6 +2309,8 @@ impl Renderer {
+             &lightmap_view,
+             &lightmap_sampler,
+             &emission_stats.view,
++            &animated_view,
++            &sprite_layers,
+         );
+         let index_quads = 1 << 16;
+         let indices = Self::quad_indices(&device, index_quads);
+@@ -2070,6 +2336,10 @@ impl Renderer {
+             mapped_at_creation: false,
+         });
+         let (atlas_pixels, atlas_width, atlas_height) = hud_atlas;
++        log::info!(
++            "Horizon: shared atlas {atlas_width}x{atlas_height}, {} MiB",
++            u64::from(atlas_width) * u64::from(atlas_height) * 4 / (1024 * 1024)
++        );
+         let limit = device.limits().max_texture_dimension_2d;
+         if atlas_width.max(atlas_height) > limit {
+             return Err(format!(
+@@ -2077,28 +2347,164 @@ impl Renderer {
+             )
+             .into());
+         }
+-        let atlas = device.create_texture_with_data(
+-            &queue,
+-            &wgpu::TextureDescriptor {
+-                label: Some("Shared atlas"),
+-                size: wgpu::Extent3d {
+-                    width: atlas_width,
+-                    height: atlas_height,
+-                    depth_or_array_layers: 1,
+-                },
+-                mip_level_count: 1,
+-                sample_count: 1,
+-                dimension: wgpu::TextureDimension::D2,
+-                format: wgpu::TextureFormat::Rgba8Unorm,
+-                // COPY_SRC: a shader pack's weather copies the rain and snow sprites out.
+-                usage: wgpu::TextureUsages::TEXTURE_BINDING
+-                    | wgpu::TextureUsages::COPY_DST
+-                    | wgpu::TextureUsages::COPY_SRC,
+-                view_formats: &[],
+-            },
+-            wgpu::util::TextureDataOrder::LayerMajor,
+-            atlas_pixels,
+-        );
++        // The loading screen hands the game the same atlas pixels: reusing the
++        // previous texture skips the upload and, where the GPU's memory counts
++        // against the process (a 1 GB handheld's Mali), a second copy of it.
++        let reused = previous
++            .and_then(|renderer| renderer.hud.atlas_texture.as_ref())
++            .filter(|texture| texture.width() == atlas_width && texture.height() == atlas_height);
++        // The baked ASTC copy of that spill, when `patch.bash` made one and
++        // this GPU samples it: a quarter of the bytes to read and to hold.
++        // Not the ASTC bake: the atlas takes run-time patches (font glyphs,
++        // skins, maps) as RGBA at arbitrary positions, and an ASTC texture can
++        // only be written in whole 4x4 blocks, which made the first patched
++        // frame fail with "Copy origin's x component is not a multiple of block
++        // width". Compressing it needs those mutable sprites in a texture of
++        // their own first; the bake stays beside the spill for that.
++        let baked: Option<wgpu::Texture> = None;
++        let atlas = match reused {
++            Some(texture) => {
++                log::info!(
++                    "Horizon: shared atlas {atlas_width}x{atlas_height} reused from the previous renderer"
++                );
++                texture.clone()
++            }
++            None if baked.is_some() => {
++                log::info!(
++                    "Horizon: shared atlas {atlas_width}x{atlas_height} loaded from its ASTC bake"
++                );
++                baked.expect("checked just above")
++            }
++            None if atlas_pixels.is_empty() => {
++                // The caller spilled the CPU atlas to the game folder and
++                // dropped it, because 80 MiB of pixels held beside a world's
++                // tables is what a 1 GB console's killer acts on. Stream it
++                // back a band at a time: the transient copy stays a few MiB.
++                let Some(path) = hud_atlas_file else {
++                    return Err(
++                        "the shared atlas has no CPU pixels left and no previous texture to reuse"
++                            .into(),
++                    );
++                };
++                use std::io::{Read as _, Seek as _, SeekFrom};
++                let atlas = device.create_texture(&wgpu::TextureDescriptor {
++                    label: Some("Shared atlas"),
++                    size: wgpu::Extent3d {
++                        width: atlas_width,
++                        height: atlas_height,
++                        depth_or_array_layers: 1,
++                    },
++                    mip_level_count: 1,
++                    sample_count: 1,
++                    dimension: wgpu::TextureDimension::D2,
++                    format: wgpu::TextureFormat::Rgba8Unorm,
++                    usage: wgpu::TextureUsages::TEXTURE_BINDING
++                        | wgpu::TextureUsages::COPY_DST
++                        | wgpu::TextureUsages::COPY_SRC,
++                    view_formats: &[],
++                });
++                let started = std::time::Instant::now();
++                let bytes_per_row = atlas_width * 4;
++                let rows = (4 * 1024 * 1024 / bytes_per_row).clamp(1, atlas_height);
++                let mut buf = vec![0u8; (rows * bytes_per_row) as usize];
++                let mut file = std::fs::File::open(path).map_err(|e| {
++                    format!("the shared atlas at {}: {e}", path.display())
++                })?;
++                let mut y = 0;
++                while y < atlas_height {
++                    let height = rows.min(atlas_height - y);
++                    let len = (height * bytes_per_row) as usize;
++                    file.seek(SeekFrom::Start(u64::from(y) * u64::from(bytes_per_row)))
++                        .map_err(|e| e.to_string())?;
++                    file.read_exact(&mut buf[..len]).map_err(|e| e.to_string())?;
++                    queue.write_texture(
++                        wgpu::TexelCopyTextureInfo {
++                            texture: &atlas,
++                            mip_level: 0,
++                            origin: wgpu::Origin3d { x: 0, y, z: 0 },
++                            aspect: wgpu::TextureAspect::All,
++                        },
++                        &buf[..len],
++                        wgpu::TexelCopyBufferLayout {
++                            offset: 0,
++                            bytes_per_row: Some(bytes_per_row),
++                            rows_per_image: Some(height),
++                        },
++                        wgpu::Extent3d {
++                            width: atlas_width,
++                            height,
++                            depth_or_array_layers: 1,
++                        },
++                    );
++                    queue.submit([]);
++                    y += height;
++                }
++                log::info!(
++                    "Horizon: shared atlas {atlas_width}x{atlas_height} streamed from {} in {} ms",
++                    path.display(),
++                    started.elapsed().as_millis()
++                );
++                atlas
++            }
++            None => {
++                let atlas = device.create_texture(&wgpu::TextureDescriptor {
++                    label: Some("Shared atlas"),
++                    size: wgpu::Extent3d {
++                        width: atlas_width,
++                        height: atlas_height,
++                        depth_or_array_layers: 1,
++                    },
++                    mip_level_count: 1,
++                    sample_count: 1,
++                    dimension: wgpu::TextureDimension::D2,
++                    format: wgpu::TextureFormat::Rgba8Unorm,
++                    // COPY_SRC: a shader pack's weather copies the rain and snow sprites out.
++                    usage: wgpu::TextureUsages::TEXTURE_BINDING
++                        | wgpu::TextureUsages::COPY_DST
++                        | wgpu::TextureUsages::COPY_SRC,
++                    view_formats: &[],
++                });
++                // `create_texture_with_data` stages the whole atlas (80 MiB on
++                // the default resources) in one buffer, which lands beside the
++                // packed CPU atlas at the peak of a 1 GB handheld. Upload in
++                // row chunks, flushing each staging buffer before the next, so
++                // the transient copy stays a few MiB.
++                let bytes_per_row = atlas_width * 4;
++                let rows = (4 * 1024 * 1024 / bytes_per_row).clamp(1, atlas_height);
++                let mut y = 0;
++                while y < atlas_height {
++                    let height = rows.min(atlas_height - y);
++                    let start = (y * bytes_per_row) as usize;
++                    let end = start + (height * bytes_per_row) as usize;
++                    queue.write_texture(
++                        wgpu::TexelCopyTextureInfo {
++                            texture: &atlas,
++                            mip_level: 0,
++                            origin: wgpu::Origin3d { x: 0, y, z: 0 },
++                            aspect: wgpu::TextureAspect::All,
++                        },
++                        &atlas_pixels[start..end],
++                        wgpu::TexelCopyBufferLayout {
++                            offset: 0,
++                            bytes_per_row: Some(bytes_per_row),
++                            rows_per_image: Some(height),
++                        },
++                        wgpu::Extent3d {
++                            width: atlas_width,
++                            height,
++                            depth_or_array_layers: 1,
++                        },
++                    );
++                    queue.submit([]);
++                    y += height;
++                }
++                log::info!(
++                    "Horizon: shared atlas {atlas_width}x{atlas_height} uploaded, rss {} MiB",
++                    rss_mib_for_log()
++                );
++                atlas
++            }
++        };
+         let atlas_view = atlas.create_view(&Default::default());
+         // vanilla's `GlintSampler`: enchanted_glint_item as its own texture,
+         // repeated per pixel (`clamp: false`), linear without mipmaps
+@@ -3170,6 +3576,9 @@ impl Renderer {
+             lightmap,
+             sprite_textures,
+             sprite_unused,
++            animated_view,
++            sprite_layers,
++            sprite_astc,
+             mip_levels,
+             mipmaps: mip_levels - 1,
+             terrain_layout: bindings,
+@@ -4236,6 +4645,12 @@ impl Renderer {
+ 
+     fn pack_terrain_inputs(&mut self) -> Option<horizon_shaders::GbuffersInputs> {
+         if self.pack_atlas.is_none() {
++            if self.sprite_astc {
++                log::warn!(
++                    "Horizon: a shader pack needs RGBA block sprites; the ASTC bake is skipped"
++                );
++                return None;
++            }
+             let mut encoder = self.device.create_command_encoder(&Default::default());
+             let layers = self
+                 .sprite_textures
+@@ -4346,6 +4761,8 @@ impl Renderer {
+             &self.lightmap_view,
+             &self.lightmap_sampler,
+             &self.emission_stats.view,
++            &self.animated_view,
++            &self.sprite_layers,
+         );
+     }
+     /// The Mipmap Levels option: block textures sample at most `levels`
+diff --git a/crates/horizon-client-render/src/gfx/animate.rs b/crates/horizon-client-render/src/gfx/animate.rs
+index e16ce87..b269158 100644
+--- a/crates/horizon-client-render/src/gfx/animate.rs
++++ b/crates/horizon-client-render/src/gfx/animate.rs
+@@ -77,18 +77,21 @@ pub(super) struct SpriteAnimator {
+ }
+ 
+ impl SpriteAnimator {
+-    /// `textures` are the sprite arrays, `split` layers each, `size` pixels
+-    /// wide; `animations` hold their frames at that size. `compute`: whether
+-    /// the device says it runs compute shaders writing storage textures.
++    /// `texture` holds the animated sprites' layers, `size` pixels wide, and
++    /// `layer_index` maps a block sprite's layer to its layer there (or
++    /// `u32::MAX` when it does not animate); `animations` hold their frames at
++    /// that size. `compute`: whether the device says it runs compute shaders
++    /// writing storage textures.
+     pub fn new(
+         device: &wgpu::Device,
+         animations: &[SpriteAnimation],
+         size: u32,
+         settings: &[Settings],
+-        textures: &[wgpu::Texture],
+-        split: u32,
++        texture: &wgpu::Texture,
++        layer_index: &[u32],
+         compute: bool,
+     ) -> Self {
++        let textures = std::slice::from_ref(texture);
+         let pipeline = if compute { pipeline(device) } else { None };
+         let limits = device.limits();
+         let limit = if pipeline.is_some() {
+@@ -105,6 +108,9 @@ impl SpriteAnimator {
+         let mut counts: Vec<usize> = Vec::new();
+         let mut sprites = Vec::with_capacity(animations.len());
+         for animation in animations {
++            let Some(&dense) = layer_index.get(animation.layer as usize) else {
++                continue;
++            };
+             let pixels: Vec<_> = (0..animation.frame_count())
+                 .map(|frame| animation.pixels(frame))
+                 .collect();
+@@ -133,7 +139,7 @@ impl SpriteAnimator {
+                     offset
+                 })
+                 .collect();
+-            let key = (animation.layer / split, buffer);
++            let key = (0, buffer);
+             let group = keys.iter().position(|&k| k == key).unwrap_or_else(|| {
+                 keys.push(key);
+                 counts.push(0);
+@@ -143,7 +149,7 @@ impl SpriteAnimator {
+             sprites.push(Sprite {
+                 animation: animation.clone(),
+                 shown: None,
+-                layer: animation.layer % split,
++                layer: dense,
+                 frames: offsets,
+                 edge,
+                 group,
+@@ -495,9 +501,14 @@ fn source_chains(
+         sheet.pixels.extend_from_slice(frame.as_chunks::<4>().0);
+     }
+     let has_transparent = s.has_transparent || sheet.pixels.iter().any(|p| p[3] == 0);
++    // The array's chains are as long as the option builds them (see
++    // `sprites::mip_cap`): a Mali pads every level of every layer.
++    let reduced = edge
++        .trailing_zeros()
++        .min(crate::sprites::mip_cap().saturating_sub(1));
+     let levels = crate::mipmap::generate(
+         sheet,
+-        edge.trailing_zeros(),
++        reduced,
+         Settings {
+             has_transparent,
+             ..s
+diff --git a/crates/horizon-client-render/src/gfx/arena.rs b/crates/horizon-client-render/src/gfx/arena.rs
+index f147b84..1782d80 100644
+--- a/crates/horizon-client-render/src/gfx/arena.rs
++++ b/crates/horizon-client-render/src/gfx/arena.rs
+@@ -234,7 +234,10 @@ impl Arena {
+             && self.closing != Some(last as u32)
+         {
+             let current = page.capacity;
+-            let grown = (current * 2).max(current + len).min(self.page_limit);
++            // Half again, not twice: doubling overshoots what a small render
++            // distance needs, and the extra vertices stay resident (a 1 GB
++            // handheld cannot spare the ~90 MiB a doubled page can waste).
++            let grown = (current + current / 2).max(current + len).min(self.page_limit);
+             if (grown - current >= len || grown == self.page_limit)
+                 && self.grow(device, encoder, last, grown)
+                 && let Some(start) = self.pages[last].as_mut().unwrap().free.take(len)
+@@ -272,6 +275,10 @@ impl Arena {
+                 self.pages.len() - 1
+             });
+         self.pages[index] = Some(page);
++        log::info!(
++            "Horizon: terrain arena page {index} opened at {} MiB",
++            capacity * self.stride >> 20
++        );
+         Some((index as u32, start))
+     }
+     /// A range of `vertices` in a page that exists already and is not being
+@@ -413,6 +420,10 @@ impl Arena {
+         old.host = host;
+         old.capacity = capacity;
+         old.free.give(previous, capacity - previous);
++        log::info!(
++            "Horizon: terrain arena page {page} grown to {} MiB",
++            capacity * self.stride >> 20
++        );
+         true
+     }
+     /// Reclaim after an upload batch, so replacing a section can reuse its range.
+diff --git a/crates/horizon-client-render/src/gfx/panorama.rs b/crates/horizon-client-render/src/gfx/panorama.rs
+index 1c17e0b..33f7863 100644
+--- a/crates/horizon-client-render/src/gfx/panorama.rs
++++ b/crates/horizon-client-render/src/gfx/panorama.rs
+@@ -13,6 +13,43 @@ pub struct Faces {
+     pub pixels: Vec<u8>,
+ }
+ 
++/// A cube face of the title backdrop, at most this many texels a side.
++///
++/// The panorama is drawn behind the menu at the window's size, so a
++/// 1024x1024 face holds detail no screen shows, at 24 MiB of CPU pixels and
++/// as much again on the GPU. A quarter of the side keeps it soft but
++/// recognisable and costs 1.5 MiB.
++const FACE_MAX: u32 = 256;
++
++/// `data` box-filtered down to [`FACE_MAX`] a side, if it is larger.
++fn shrink(w: u32, data: Vec<u8>) -> (u32, Vec<u8>) {
++    let factor = w / FACE_MAX;
++    if factor <= 1 {
++        return (w, data);
++    }
++    let side = w / factor;
++    let count = (factor * factor) as u32;
++    let mut out = vec![0u8; (side * side * 4) as usize];
++    for y in 0..side {
++        for x in 0..side {
++            let mut acc = [0u32; 4];
++            for dy in 0..factor {
++                for dx in 0..factor {
++                    let i = (((y * factor + dy) * w + (x * factor + dx)) * 4) as usize;
++                    for (c, sum) in acc.iter_mut().enumerate() {
++                        *sum += data[i + c] as u32;
++                    }
++                }
++            }
++            let o = ((y * side + x) * 4) as usize;
++            for (c, sum) in acc.iter().enumerate() {
++                out[o + c] = (sum / count) as u8;
++            }
++        }
++    }
++    (side, out)
++}
++
+ impl Faces {
+     pub fn load(root: &Path) -> Self {
+         Self::try_load(root).unwrap_or_else(|error| {
+@@ -27,17 +64,21 @@ impl Faces {
+     fn try_load(root: &Path) -> Result<Self> {
+         let background = root.join("assets/minecraft/textures/gui/title/background");
+         let mut size = 0;
++        // The faces' own size, before `shrink`: every face must match it.
++        let mut source = 0;
+         let mut pixels = Vec::new();
+         for face in FACE_ORDER {
+             let path = background.join(format!("panorama_{face}.png"));
+             let (w, h, data) = decode(&path)?;
+-            if w != h || (size != 0 && w != size) {
++            if w != h || (source != 0 && w != source) {
+                 return Err(format!(
+                     "{}: panorama faces must be equally sized squares",
+                     path.display()
+                 )
+                 .into());
+             }
++            source = w;
++            let (w, data) = shrink(w, data);
+             size = w;
+             // CubeMapTexture copies each original image with flipY=true. Keep every texel.
+             for row in data.chunks_exact((w * 4) as usize).rev() {
+@@ -73,6 +114,12 @@ impl Panorama {
+         format: wgpu::TextureFormat,
+         faces: &Faces,
+     ) -> Self {
++        log::info!(
++            "Horizon: title panorama {}x{}x6, {} MiB",
++            faces.size,
++            faces.size,
++            u64::from(faces.size) * u64::from(faces.size) * 6 * 4 / (1024 * 1024)
++        );
+         let texture = device.create_texture_with_data(
+             queue,
+             &wgpu::TextureDescriptor {
+diff --git a/crates/horizon-client-render/src/graphics.rs b/crates/horizon-client-render/src/graphics.rs
+index 83d2b53..c0052e6 100644
+--- a/crates/horizon-client-render/src/graphics.rs
++++ b/crates/horizon-client-render/src/graphics.rs
+@@ -421,9 +421,9 @@ impl Default for Graphics {
+             lod_distance: 0,
+             far_detail: FarDetail::Full,
+             cave_culling: true,
+-            entity_culling: false,
+-            chunk_updates: 0,
+-            upload_budget_kib: 0,
++            entity_culling: true,
++            chunk_updates: 4,
++            upload_budget_kib: 512,
+             sky: true,
+             fog: true,
+             weather: true,
+diff --git a/crates/horizon-client-render/src/hud.rs b/crates/horizon-client-render/src/hud.rs
+index 6bd07b7..b82dc62 100644
+--- a/crates/horizon-client-render/src/hud.rs
++++ b/crates/horizon-client-render/src/hud.rs
+@@ -83,6 +83,10 @@ pub struct HudAtlas {
+     /// A resource pack's own `core/text` shader for the GUI's text, translated;
+     /// none draws the text natively.
+     pub text_shader: Option<std::sync::Arc<horizon_shaders::CoreProgram>>,
++    /// The used width in texels of each `font/ascii_sga` glyph, measured while
++    /// the atlas is packed: the enchanting table's Galactic text spaces by it,
++    /// and the CPU copy of the atlas is freed once it is on the GPU.
++    pub galactic: [u8; 256],
+     white: Rect,
+ }
+ /// Atlas rows reserved for glyphs rasterized at run time.
+@@ -477,6 +481,7 @@ impl HudAtlas {
+             sprite_animations: Vec::new(),
+             glint: (vec![0; 4], 1, 1),
+             glint_armor: (vec![0; 4], 1, 1),
++            galactic: [0; 256],
+             white,
+             text_shader: None,
+         }
+@@ -673,7 +678,7 @@ impl HudAtlas {
+         let mut pixels = vec![0u8; (width * height * 4) as usize];
+         let mut sprites = HashMap::new();
+         let mut translucent = HashSet::new();
+-        for ((name, w, h, data), (px, py)) in images.iter().zip(placements) {
++        for ((name, w, h, data), (px, py)) in images.drain(..).zip(placements) {
+             if data
+                 .as_chunks::<4>()
+                 .0
+@@ -682,14 +687,18 @@ impl HudAtlas {
+             {
+                 translucent.insert(name.clone());
+             }
+-            for row in 0..*h {
++            for row in 0..h {
+                 let src = &data[(row * w * 4) as usize..((row + 1) * w * 4) as usize];
+                 let dst = (((py + row) * width + px) * 4) as usize;
+                 pixels[dst..dst + (w * 4) as usize].copy_from_slice(src);
+             }
+-            let b = u32::from(bordered.contains(name));
++            // The image is in the atlas now: let it go before the next one is
++            // decoded into place, so the whole decoded set and the atlas never
++            // both sit in memory (tens of MiB of a 1 GB handheld's load peak).
++            drop(data);
++            let b = u32::from(bordered.contains(&name));
+             let (px, py, w, h) = (px + b, py + b, w - 2 * b, h - 2 * b);
+-            let (gw, gh) = gui_sizes.get(name).copied().unwrap_or((w, h));
++            let (gw, gh) = gui_sizes.get(&name).copied().unwrap_or((w, h));
+             sprites.insert(
+                 name.clone(),
+                 Rect {
+@@ -702,6 +711,33 @@ impl HudAtlas {
+                 },
+             );
+         }
++        // The stitched atlas holds everything the images did; the decoded
++        // copies are 80 MiB of a handheld's RAM and nothing reads them again.
++        drop(images);
++        // Measure the Galactic alphabet's glyphs now: `stations.rs` spaces its
++        // text by them, and the CPU atlas is dropped after the GPU upload.
++        let mut galactic = [0u8; 256];
++        if let Some(sheet) = sprites.get("font/ascii_sga").copied() {
++            let cell = sheet.w / 16;
++            let (px, py) = (
++                (sheet.u0 * width as f32) as u32,
++                (sheet.v0 * height as f32) as u32,
++            );
++            for code in (0x41u32..=0x5A).chain(0x61..=0x7A) {
++                let (col, row) = (code % 16, code / 16);
++                let (cx, cy) = (px + col * cell, py + row * cell);
++                let mut used = 0;
++                for dx in (0..cell).rev() {
++                    if (0..cell).any(|dy| {
++                        pixels[(((cy + dy) * width + cx + dx) * 4 + 3) as usize] != 0
++                    }) {
++                        used = dx + 1;
++                        break;
++                    }
++                }
++                galactic[code as usize] = used as u8;
++            }
++        }
+         // Every animated sprite animates: the packed strip is the raw first
+         // frame, while the mcmeta's frame list may start anywhere, so each
+         // animation's frame(0) overwrites its atlas rect before drawing.
+@@ -760,6 +796,7 @@ impl HudAtlas {
+             glint,
+             glint_armor,
+             text_shader: None,
++            galactic,
+             font,
+             white,
+         })
+diff --git a/crates/horizon-client-render/src/lib.rs b/crates/horizon-client-render/src/lib.rs
+index df02acc..7fe3529 100644
+--- a/crates/horizon-client-render/src/lib.rs
++++ b/crates/horizon-client-render/src/lib.rs
+@@ -2,6 +2,7 @@
+ //! the HUD, menus and settings. Gameplay (horizon-client) builds on it; nothing here reaches gameplay.
+ #![forbid(unsafe_code)]
+ pub mod assets;
++pub mod astc;
+ pub mod atlas_sources;
+ pub mod audio;
+ pub mod auth;
+diff --git a/crates/horizon-client-render/src/settings.rs b/crates/horizon-client-render/src/settings.rs
+index 7421568..75185e5 100644
+--- a/crates/horizon-client-render/src/settings.rs
++++ b/crates/horizon-client-render/src/settings.rs
+@@ -362,10 +362,14 @@ impl Settings {
+         };
+         settings.describe_for_crashes();
+         // Options.load: the backend asked for at startup, what a restart is measured from.
+-        Self {
++        let settings = Self {
+             startup_api: settings.horizon.api,
+             ..settings
+-        }
++        };
++        // Before any renderer builds a block sprite array: the option decides
++        // how many mip levels each array allocates (`sprites::mip_cap`).
++        crate::sprites::set_mip_cap(settings.mipmap_levels);
++        settings
+     }
+     /// The render settings and resource packs a crash report lists.
+     fn describe_for_crashes(&self) {
+@@ -417,7 +421,7 @@ impl Settings {
+         for (i, source) in SOUND_SOURCES.iter().enumerate() {
+             volumes[i] = f.double(&format!("soundCategory_{source}")) as f32;
+         }
+-        Self {
++        let settings = Self {
+             fov: f.int("fov") as f32,
+             render_distance: f.int("renderDistance"),
+             simulation_distance: f.int("simulationDistance"),
+@@ -496,7 +500,11 @@ impl Settings {
+             resource_packs: f.list("resourcePacks"),
+             keys,
+             file: f,
+-        }
++        };
++        // Before any renderer builds a block sprite array: the option decides
++        // how many mip levels each array allocates (`sprites::mip_cap`).
++        crate::sprites::set_mip_cap(settings.mipmap_levels);
++        settings
+     }
+     /// `Options.createInformation`: what the server learns about this player.
+     pub fn client_information(&self, view_distance: i8) -> ClientInformation {
+diff --git a/crates/horizon-client-render/src/sprites.rs b/crates/horizon-client-render/src/sprites.rs
+index d4b2dd5..ec1c3d2 100644
+--- a/crates/horizon-client-render/src/sprites.rs
++++ b/crates/horizon-client-render/src/sprites.rs
+@@ -97,6 +97,65 @@ pub const SPRITE_SIZE: u32 = 16;
+ /// Largest sprite array (all layers of the top mip level): resource packs
+ /// with bigger textures are sampled down to fit.
+ const MAX_ARRAY_BYTES: u64 = 256 << 20;
++/// The most one sprite array may take on this device: [`MAX_ARRAY_BYTES`],
++/// or a sixteenth of the machine's RAM when that is smaller. The array is
++/// copied once more for its upload and lives beside the world and the
++/// driver's own padding, so a resource pack's 256 MiB texture must not
++/// decide the cell on a 1 GB handheld. Read once; no env var.
++fn array_budget() -> u64 {
++    static BUDGET: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
++    *BUDGET.get_or_init(|| {
++        let total = std::fs::read_to_string("/proc/meminfo")
++            .ok()
++            .and_then(|t| {
++                t.lines().find_map(|line| {
++                    let rest = line.strip_prefix("MemTotal:")?;
++                    let kib: u64 = rest.split_whitespace().next()?.parse().ok()?;
++                    Some(kib * 1024)
++                })
++            });
++        total
++            .map_or(MAX_ARRAY_BYTES, |bytes| (bytes / 16).clamp(16 << 20, MAX_ARRAY_BYTES))
++    })
++}
++/// The most mip levels a sprite array is built with: the Mipmap Levels
++/// option plus one (0: a single level), set when the options load.
++///
++/// A block sprite array costs its pixels once per level on a Mali whose
++/// driver pads every layer's every level: 16px, five levels and 256 layers
++/// are 57 MiB for 0.35 MiB of texels, one level 4 MiB. `mipmapLevels` 0,
++/// the low-memory option, is then also what vanilla means by it.
++static MIP_CAP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
++/// `mipmapLevels` from the options: 0 keeps one level, 4 builds five.
++pub fn set_mip_cap(mipmap_levels: i32) {
++    let levels = u32::try_from(mipmap_levels).unwrap_or(0).saturating_add(1);
++    set_mip_levels(levels);
++}
++/// The level count itself, for a caller whose count is not the option's: the
++/// bake covers the whole chain the format can hold, whatever the option says.
++pub fn set_mip_levels(levels: u32) {
++    MIP_CAP.store(levels.max(1), std::sync::atomic::Ordering::Relaxed);
++}
++/// The built arrays' level count: the option's, capped by
++/// `HORIZON_SPRITE_MIPS` when a test sets it.
++pub(crate) fn mip_cap() -> u32 {
++    let env = std::env::var("HORIZON_SPRITE_MIPS")
++        .ok()
++        .and_then(|v| v.parse().ok())
++        .filter(|&n| n >= 1)
++        .unwrap_or(u32::MAX);
++    MIP_CAP.load(std::sync::atomic::Ordering::Relaxed).min(env).max(1)
++}
++/// A cell edge from `HORIZON_SPRITE_CELL` (dev only, like
++/// `HORIZON_SPRITE_SPLIT`): a hard cap on the array layers' size, for devices
++/// whose GPU memory counts against the process (a 1 GB handheld's Mali), where
++/// a cell picked by one big resource-pack texture costs hundreds of MB.
++fn requested_cell() -> Option<u32> {
++    std::env::var("HORIZON_SPRITE_CELL")
++        .ok()
++        .and_then(|v| v.parse().ok())
++        .filter(|&n| (SPRITE_SIZE..=4096).contains(&n))
++}
+ /// Nearest-resample a square RGBA frame to another square size.
+ pub(crate) fn resample(frame: &[u8], from: u32, to: u32) -> Vec<u8> {
+     if from == to {
+@@ -171,9 +230,17 @@ impl Sprites {
+         let largest = self.native.iter().map(|n| n.0).max().unwrap_or(SPRITE_SIZE);
+         self.minimum_size = self.native.iter().map(|n| n.0).min().unwrap_or(SPRITE_SIZE);
+         let mut size = largest.max(SPRITE_SIZE).next_power_of_two();
+-        while size > SPRITE_SIZE && layers * u64::from(size * size) * 4 > MAX_ARRAY_BYTES {
++        let budget = array_budget();
++        while size > SPRITE_SIZE && layers * u64::from(size * size) * 4 > budget {
+             size /= 2;
+         }
++        if let Some(cell) = requested_cell() {
++            size = size.min(cell.max(SPRITE_SIZE));
++        }
++        log::info!(
++            "Horizon: {layers} sprite layers at {size}px (largest {largest}px), {} MiB per top mip",
++            layers * u64::from(size * size) * 4 / (1024 * 1024)
++        );
+         if !pixels {
+             self.pixels = Vec::new();
+             self.animations = Vec::new();
+diff --git a/crates/horizon-client-render/src/terrain.wgsl b/crates/horizon-client-render/src/terrain.wgsl
+index 8b9efe7..b30b8b2 100644
+--- a/crates/horizon-client-render/src/terrain.wgsl
++++ b/crates/horizon-client-render/src/terrain.wgsl
+@@ -52,12 +52,21 @@ struct Globals {
+ // pixels must reach to shine in HDR output: r where the bright parts shine, g
+ // where all of it does (gfx/hdr_stats.rs, measured from the sprite itself).
+ @group(0) @binding(12) var emission_thresholds: texture_2d<f32>;
++// Per block sprite, the layer its frames live at in `animated` (an array of
++// its own, because a compressed texture cannot be rewritten), or `0xFFFFFFFF`
++// when it does not animate and stays in the arrays above.
++@group(0) @binding(13) var layer_map: texture_2d<u32>;
++@group(0) @binding(14) var animated: texture_2d_array<f32>;
+ // How many sprite arrays hold layers (a pipeline constant): 1 for vanilla,
+ // which then samples exactly as before.
+ override SPRITE_ARRAYS: u32 = 1u;
+ override SPRITE_SPLIT: u32 = 2048u;
+ // A sprite sampled with the given gradients, from whichever array holds its layer.
+ fn sprite_grad(uv: vec2<f32>, layer: u32, dx: vec2<f32>, dy: vec2<f32>) -> vec4<f32> {
++    let animated_layer = textureLoad(layer_map, vec2<i32>(i32(layer), 0), 0).r;
++    if (animated_layer != 0xFFFFFFFFu) {
++        return textureSampleGrad(animated, sprite_sampler, uv, i32(animated_layer), dx, dy);
++    }
+     let l = i32(layer % SPRITE_SPLIT);
+     if SPRITE_ARRAYS == 1u {
+         return textureSampleGrad(sprites, sprite_sampler, uv, l, dx, dy);
+@@ -75,6 +84,10 @@ fn sprite_grad(uv: vec2<f32>, layer: u32, dx: vec2<f32>, dy: vec2<f32>) -> vec4<
+ }
+ // The same at an explicit mip level.
+ fn sprite_level(uv: vec2<f32>, layer: u32, lod: f32) -> vec4<f32> {
++    let animated_layer = textureLoad(layer_map, vec2<i32>(i32(layer), 0), 0).r;
++    if (animated_layer != 0xFFFFFFFFu) {
++        return textureSampleLevel(animated, sprite_sampler, uv, i32(animated_layer), lod);
++    }
+     let l = i32(layer % SPRITE_SPLIT);
+     if SPRITE_ARRAYS == 1u {
+         return textureSampleLevel(sprites, sprite_sampler, uv, l, lod);
+diff --git a/crates/horizon-client/src/game.rs b/crates/horizon-client/src/game.rs
+index e2d78bd..85b36e3 100644
+--- a/crates/horizon-client/src/game.rs
++++ b/crates/horizon-client/src/game.rs
+@@ -463,6 +463,12 @@ struct Options {
+     session_file: Option<String>,
+     /// `--session-stdin`: the session file's JSON comes on standard input instead.
+     session_stdin: bool,
++    /// `--bake-atlas`: pack the GUI atlas and write its ASTC cache, then quit.
++    /// `patch.bash` runs this once per install; it needs no window and no GPU.
++    bake_atlas: bool,
++    /// `--astcenc PATH`: the encoder `--bake-atlas` runs (default: `tools/astcenc`
++    /// beside the executable, or `$HORIZON_ASTCENC`).
++    astcenc: Option<PathBuf>,
+ }
+ /// `--in-frame`, `--no-server-thread` and `HORIZON_SERVER_THREAD=0` are deprecated:
+ /// the in-frame world is unmaintained, gets no fixes and will be removed soon.
+@@ -600,12 +606,14 @@ impl Options {
+             quick_play: None,
+             session_file: std::env::var("HORIZON_SESSION_FILE").ok(),
+             session_stdin: false,
++            bake_atlas: false,
++            astcenc: None,
+         };
+         while let Some(arg) = args.next() {
+             match arg.as_str() {
+                 "--help" | "-h" => {
+                     println!(
+-                        "Horizon — Minecraft Java Edition {} in Rust\n\n  --resources PATH        Prepared resources (horizon-prepare)\n  --render-distance N     Chunks, 2..128 (default 12)\n  --world NAME            World folder under saves/ (default \"New World\")\n  --seed N                World seed for new worlds (default 0)\n  --width N, --height N   Window size (default 1280 x 720)\n  --creative              Creative mode (default survival)\n  --test-terrain          Simple test terrain instead of vanilla generation\n  --frames N              Exit after N frames (testing)\n  --world-frames N        Exit after N frames drawn in the world (testing)\n  --smoke-report PATH     Write a JSON report on exit\n  --benchmark SCENARIO    Run a benchmark (standard, village, forest, ocean, mountain), write its report to benchmarks/ and quit\n  --control               Accept horizon-ctl commands on a local socket\n  --control-socket PATH   Control socket path (default $XDG_RUNTIME_DIR/horizon-control.sock)\n  --server HOST[:PORT]    Join a multiplayer server (offline mode) at start\n  --quickPlaySingleplayer WORLD  Open this world of saves/ at start, only if it exists (vanilla's)\n  --quickPlayMultiplayer HOST[:PORT]  The same as --server (vanilla's name)\n  --name NAME             Player name for multiplayer (default: generated once, kept in horizon-player.txt)\n  --session-file PATH     Signed-in account from the launcher (read once, then deleted)\n  --session-stdin         The same account as JSON on standard input\n  --game-dir DIR          Game folder: saves, options.txt, packs, mods (default: the working directory)\n  --home DIR              Logs and crash reports (default $HORIZON_HOME, else the platform data folder)\n  --fullscreen            Open the window fullscreen\n  --launch-api            Print the Launch API version and options as JSON (docs/api/launch.md)\n  --dev-mod PATH          A content mod (.hmod or folder) to develop: always on\n  --in-frame              DEPRECATED, do not use: unsupported, will be removed soon (also --no-server-thread)\n  --pregen                Add Horizon's /pregen command (docs/pregeneration.md)\n\nControls: mouse look, WASD move, Space jump, Left Shift sneak, Left Ctrl sprint,\nleft click break, right click place/use, 1-9/scroll hotbar, E inventory,\nQ drop, F3 debug, Esc pause.",
++                        "Horizon — Minecraft Java Edition {} in Rust\n\n  --resources PATH        Prepared resources (horizon-prepare)\n  --render-distance N     Chunks, 2..128 (default 12)\n  --world NAME            World folder under saves/ (default \"New World\")\n  --seed N                World seed for new worlds (default 0)\n  --width N, --height N   Window size (default 1280 x 720)\n  --creative              Creative mode (default survival)\n  --test-terrain          Simple test terrain instead of vanilla generation\n  --frames N              Exit after N frames (testing)\n  --world-frames N        Exit after N frames drawn in the world (testing)\n  --smoke-report PATH     Write a JSON report on exit\n  --benchmark SCENARIO    Run a benchmark (standard, village, forest, ocean, mountain), write its report to benchmarks/ and quit\n  --control               Accept horizon-ctl commands on a local socket\n  --control-socket PATH   Control socket path (default $XDG_RUNTIME_DIR/horizon-control.sock)\n  --bake-atlas            Pack the GUI atlas and write its ASTC cache, then quit (patch.bash)\n  --server HOST[:PORT]    Join a multiplayer server (offline mode) at start\n  --quickPlaySingleplayer WORLD  Open this world of saves/ at start, only if it exists (vanilla's)\n  --quickPlayMultiplayer HOST[:PORT]  The same as --server (vanilla's name)\n  --name NAME             Player name for multiplayer (default: generated once, kept in horizon-player.txt)\n  --session-file PATH     Signed-in account from the launcher (read once, then deleted)\n  --session-stdin         The same account as JSON on standard input\n  --game-dir DIR          Game folder: saves, options.txt, packs, mods (default: the working directory)\n  --home DIR              Logs and crash reports (default $HORIZON_HOME, else the platform data folder)\n  --fullscreen            Open the window fullscreen\n  --launch-api            Print the Launch API version and options as JSON (docs/api/launch.md)\n  --dev-mod PATH          A content mod (.hmod or folder) to develop: always on\n  --in-frame              DEPRECATED, do not use: unsupported, will be removed soon (also --no-server-thread)\n  --pregen                Add Horizon's /pregen command (docs/pregeneration.md)\n\nControls: mouse look, WASD move, Space jump, Left Shift sneak, Left Ctrl sprint,\nleft click break, right click place/use, 1-9/scroll hotbar, E inventory,\nQ drop, F3 debug, Esc pause.",
+                         horizon_core::VANILLA_VERSION
+                     );
+                     return Ok(None);
+@@ -630,6 +638,7 @@ impl Options {
+                     o.offscreen = true;
+                 }
+                 "--control" => o.control = Some(horizon_client::control::default_path()),
++                "--bake-atlas" => o.bake_atlas = true,
+                 "--server-thread" => o.server_thread = true,
+                 "--in-frame" | "--no-server-thread" => {
+                     warn_in_frame_deprecated(&arg);
+@@ -705,6 +714,7 @@ impl Options {
+                             "--name" => o.player_name = Some(value),
+                             "--session-file" => o.session_file = Some(value),
+                             "--control-socket" => o.control = Some(value.into()),
++                            "--astcenc" => o.astcenc = Some(value.into()),
+                             "--time" => o.time = Some(value.parse()?),
+                             "--weather" => o.weather = Some(value),
+                             "--dimension" => {
+@@ -1847,6 +1857,10 @@ pub(super) fn armor_slot(index: usize) -> horizon_world::player_inventory::Equip
+ pub struct UiResources {
+     /// The GUI, font, particle, map and skin atlas.
+     pub atlas: HudAtlas,
++    /// Where the atlas's CPU pixels were spilled when they were too large to
++    /// hold next to a world's tables; the renderer streams the texture back
++    /// from it. `None` while `HudAtlas::pixels` still holds them.
++    pub atlas_file: Option<PathBuf>,
+     /// The title screen's panorama faces.
+     pub panorama: Arc<horizon_client::gfx::panorama::Faces>,
+ }
+@@ -1856,6 +1870,7 @@ impl UiResources {
+     pub fn load(root: &std::path::Path, defaults: &std::path::Path) -> Result<Self> {
+         Ok(Self {
+             atlas: HudAtlas::build_over(root, defaults)?,
++            atlas_file: None,
+             panorama: Arc::new(horizon_client::gfx::panorama::Faces::load(root)),
+         })
+     }
+@@ -1864,6 +1879,7 @@ impl UiResources {
+     pub fn server(root: &std::path::Path) -> Result<Self> {
+         Ok(Self {
+             atlas: HudAtlas::fonts(root)?,
++            atlas_file: None,
+             panorama: Arc::new(horizon_client::gfx::panorama::Faces {
+                 size: 1,
+                 pixels: [0u8; 4].repeat(6),
+@@ -16831,6 +16847,30 @@ impl Game<'_> {
+                         }
+                         self.frames += 1;
+                         self.fps_frames += 1;
++                        // One profile line in the ordinary log every 250 world
++                        // frames (about ten seconds at the frame rates a
++                        // handheld reaches), so a session can be read back
++                        // afterwards with no control socket and no overlay:
++                        // frame time percentiles, CPU time, and which phase
++                        // the frame spent it in. Silent off the world.
++                        if self.world_frames % 250 == 249 {
++                            let summary = self.frame_stats.summary();
++                            let number = |v: &serde_json::Value| v.as_f64().unwrap_or(f64::NAN);
++                            let phases = &summary["phases_avg_ms"];
++                            log::info!(
++                                "Horizon: profile {:.1} fps, frame p50 {:.1} p95 {:.1} max {:.1} ms, cpu {:.1} ms, phases update {:.1} tick {:.1} prepare {:.1} render {:.1}",
++                                number(&summary["avg_fps"]),
++                                number(&summary["p50_ms"]),
++                                number(&summary["p95_ms"]),
++                                number(&summary["max_ms"]),
++                                number(&summary["cpu"]["avg_ms"]),
++                                number(&phases["update"]),
++                                number(&phases["tick"]),
++                                number(&phases["prepare"]),
++                                number(&phases["render"]),
++                            );
++                            self.frame_stats.reset();
++                        }
+                         horizon_client::crash::debug_crash_tick();
+                         if self.fps_at.elapsed() >= Duration::from_secs(1) {
+                             self.fps = self.fps_frames as f32 / self.fps_at.elapsed().as_secs_f32();
+@@ -17993,6 +18033,7 @@ struct GameplayTables {
+ fn load_core(
+     root: &std::path::Path,
+     headless: bool,
++    sprites: bool,
+     parallel: bool,
+     progress: &Progress,
+ ) -> std::result::Result<std::result::Result<CoreTables, String>, String> {
+@@ -18007,8 +18048,9 @@ fn load_core(
+             let assets = &assets;
+             let render = Step::spawn(scope, parallel, move || {
+                 // A server reads no block sprites' pixels, which only the
+-                // renderer draws (32 MB).
+-                let render = if headless {
++                // renderer draws (32 MB). The bake runs without a window, but
++                // it packs the renderer's own arrays, so it asks for them.
++                let render = if headless && !sprites {
+                     assets.reload_for_server(root)
+                 } else {
+                     assets.reload(root)
+@@ -18048,6 +18090,7 @@ fn load_core(
+                 collision.join(),
+             )
+         });
++    horizon_threads::release_free_memory();
+     // The packs' failure first: it rolls back whatever else failed.
+     let (render, item_renderer) = match render {
+         Ok(render) => render,
+@@ -18096,6 +18139,7 @@ fn gameplay_tables(
+             MotionResources::load_with_facts(root, assets, &facts).map_err(|e| e.to_string());
+         (light.join(), motion)
+     });
++    horizon_threads::release_free_memory();
+     Ok(GameplayTables {
+         light: light?,
+         motion: motion?,
+@@ -18117,6 +18161,7 @@ fn load_resources(
+     started: Instant,
+     menu: bool,
+     headless: bool,
++    sprites: bool,
+     progress: &Progress,
+     publish: &mut dyn FnMut(UiResources, &std::path::Path),
+ ) -> Result<Loaded> {
+@@ -18155,7 +18200,7 @@ fn load_resources(
+     let (core, loaded_gui) = loop {
+         let (ui, core) = std::thread::scope(|scope| {
+             let core = Step::spawn(scope, parallel, || {
+-                load_core(&root, headless, parallel, progress)
++                load_core(&root, headless, sprites, parallel, progress)
+             });
+             let ui = load_ui(&root).map(|ui| offer(ui, &root));
+             (ui, core.join())
+@@ -18180,7 +18225,11 @@ fn load_resources(
+         pack_error = Some(failure);
+         root = vanilla_root.to_path_buf();
+     };
+-    log::info!("load core tables: {:.2}s", started.elapsed().as_secs_f32());
++    log::info!(
++        "load core tables: {:.2}s, rss {} MiB",
++        started.elapsed().as_secs_f32(),
++        rss_mib()
++    );
+     let CoreTables {
+         assets,
+         render,
+@@ -18214,7 +18263,11 @@ fn load_resources(
+         biomes.clone(),
+         Arc::new(light),
+     );
+-    log::info!("load pack tables: {:.2}s", started.elapsed().as_secs_f32());
++    log::info!(
++        "load pack tables: {:.2}s, rss {} MiB",
++        started.elapsed().as_secs_f32(),
++        rss_mib()
++    );
+     progress.set(4);
+     if !menu {
+         horizon_client::ui::load_metadata(&root);
+@@ -18250,8 +18303,9 @@ fn load_resources(
+     let renderer_cpu = menu.then(|| prepare_renderer_textures(&pack));
+     if menu {
+         log::info!(
+-            "Horizon: handoff CPU resources prepared on worker in {} ms",
+-            prepared_at.elapsed().as_millis()
++            "Horizon: handoff CPU resources prepared on worker in {} ms, rss {} MiB",
++            prepared_at.elapsed().as_millis(),
++            rss_mib()
+         );
+     }
+     // The block entity renderer's face visibility: the meshes' own, whose
+@@ -18284,8 +18338,9 @@ fn load_resources(
+                 progress.set(9);
+                 horizon_client::telemetry::mark_rest_ready();
+                 log::info!(
+-                    "Horizon: rest-ready after {} ms",
+-                    started.elapsed().as_millis()
++                    "Horizon: rest-ready after {} ms, rss {} MiB",
++                    started.elapsed().as_millis(),
++                    rss_mib()
+                 );
+                 Ok(())
+             })?;
+@@ -18342,19 +18397,49 @@ fn load_world_rest(
+     let registry = assets.registry;
+     let overlay = &horizon_world::loot::PackOverlay::NONE;
+     progress.set(6);
++    log::info!("Horizon: rest load started, rss {} MiB", rss_mib());
++    let watch = RestWatch::start();
++    watch.at(0);
+     // Independent tables load together, within the worker budget the settings
+     // allow. Only the recipes and the stations read another table: the items.
+     let load_items = || -> Result<_> {
++        watch.at(1);
+         let items = Items::load(root, registry, facts, overlay)?;
+-        log::info!("load items: {:.2}s", started.elapsed().as_secs_f32());
++        // The item models' JSON trees are gone; the tail runs beside the
++        // renderer's upload, so the pages must not join that peak.
++        horizon_threads::release_free_memory();
++        log::info!(
++            "load items: {:.2}s, rss {} MiB, peak {} MiB",
++            started.elapsed().as_secs_f32(),
++            rss_mib(),
++            peak_mib()
++        );
+         progress.set(7);
++        watch.at(2);
+         let recipes = Recipes::load(root, &items, overlay)?;
++        horizon_threads::release_free_memory();
++        log::info!(
++            "load recipes: {:.2}s, rss {} MiB, peak {} MiB",
++            started.elapsed().as_secs_f32(),
++            rss_mib(),
++            peak_mib()
++        );
++        watch.at(3);
+         let stations = horizon_client::stations::StationData::load(root, &items, overlay);
++        log::info!(
++            "load stations: {:.2}s, rss {} MiB, peak {} MiB",
++            started.elapsed().as_secs_f32(),
++            rss_mib(),
++            peak_mib()
++        );
+         Ok((items, recipes, stations))
+     };
+-    let load_behaviours =
+-        || Behaviours::load_with_gameplay(registry, root, behaviour_json, gameplay_projection);
++    let load_behaviours = || {
++        watch.at(4);
++        Behaviours::load_with_gameplay(registry, root, behaviour_json, gameplay_projection)
++    };
+     let load_block_entity_render = || {
++        watch.at(5);
+         if !draws {
+             return Ok(Default::default());
+         }
+@@ -18363,6 +18448,7 @@ fn load_world_rest(
+         )
+     };
+     let load_animate = || -> Result<_> {
++        watch.at(6);
+         let animate = if draws {
+             horizon_client::animate_tick::AnimateTables::load(root, registry, biomes)?
+         } else {
+@@ -18371,6 +18457,7 @@ fn load_world_rest(
+         Ok((animate, horizon_client::fog::FogTables::load(root, biomes)))
+     };
+     let load_mobs = || -> Result<_> {
++        watch.at(7);
+         let mob_types: HashMap<_, _> = MobTypes::load(root)?
+             .types
+             .into_iter()
+@@ -18381,6 +18468,7 @@ fn load_world_rest(
+         Ok((mob_types, mob_data))
+     };
+     let load_transformers = || -> Result<_> {
++        watch.at(8);
+         let transformers = horizon_client::block_transform::Transformers::load(root, registry)?;
+         let models = (
+             perspective::player_type(root),
+@@ -18423,17 +18511,28 @@ fn load_world_rest(
+             text(load_transformers()),
+         )
+     };
++    // The six loads' scratch pages are free now, but the allocator keeps them
++    // mapped: hand them back before the world allocates its own.
++    watch.at(9);
++    horizon_threads::release_free_memory();
++    log::info!(
++        "Horizon: rest tables loaded, rss {} MiB, peak {} MiB",
++        rss_mib(),
++        peak_mib()
++    );
++    drop(watch);
+     let (items, recipes, stations) = items?;
+     let (animate, fog) = animate?;
+     let (mob_types, mob_data) = mobs?;
+     let (transformers, (player_type, player_arm, player_arm_slim, spin_attack)) = transformers?;
+     log::info!(
+-        "Horizon: resources loaded in {:.1}s; {} block states, {} items, {} biomes; {} worker threads",
++        "Horizon: resources loaded in {:.1}s; {} block states, {} items, {} biomes; {} worker threads, rss {} MiB",
+         started.elapsed().as_secs_f32(),
+         facts.states.len(),
+         items.items.len(),
+         biomes.list.len(),
+-        threads
++        threads,
++        rss_mib()
+     );
+     progress.set(8);
+     Ok(WorldRest {
+@@ -18460,6 +18559,77 @@ fn load_world_rest(
+ }
+ 
+ /// CPU mip chains for the block sprites and world border.
++/// This process's resident set size, for the low-memory instrumentation.
++fn rss_mib() -> u64 {
++    std::fs::read_to_string("/proc/self/statm")
++        .ok()
++        .and_then(|s| s.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok()))
++        .map(|pages| pages * 4 / 1024)
++        .unwrap_or(0)
++}
++
++/// The process's high-water mark, to tell a peak from the memory still held.
++fn peak_mib() -> u64 {
++    std::fs::read_to_string("/proc/self/status")
++        .ok()
++        .and_then(|s| {
++            s.lines()
++                .find(|l| l.starts_with("VmHWM:"))
++                .and_then(|l| l.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok()))
++        })
++        .map(|kb| kb / 1024)
++        .unwrap_or(0)
++}
++
++/// Logs the RSS and peak every 250 ms while a world's tables load, with the
++/// stage the loader last entered, to find which one a console runs out in.
++struct RestWatch {
++    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
++    stage: std::sync::Arc<std::sync::atomic::AtomicUsize>,
++}
++impl RestWatch {
++    const STAGES: [&'static str; 11] = [
++        "start",
++        "items",
++        "recipes",
++        "stations",
++        "behaviours",
++        "block-entity",
++        "animate",
++        "mobs",
++        "transformers",
++        "joined",
++        "waiting",
++    ];
++    fn start() -> Self {
++        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
++        let stop = std::sync::Arc::new(AtomicBool::new(false));
++        let stage = std::sync::Arc::new(AtomicUsize::new(0));
++        let (stop2, stage2) = (stop.clone(), stage.clone());
++        std::thread::spawn(move || {
++            while !stop2.load(Ordering::Relaxed) {
++                let at = stage2.load(Ordering::Relaxed);
++                log::info!(
++                    "rest watch: {} rss {} MiB, peak {} MiB",
++                    Self::STAGES.get(at).copied().unwrap_or("?"),
++                    rss_mib(),
++                    peak_mib()
++                );
++                std::thread::sleep(std::time::Duration::from_millis(250));
++            }
++        });
++        Self { stop, stage }
++    }
++    fn at(&self, stage: usize) {
++        self.stage.store(stage, std::sync::atomic::Ordering::Relaxed);
++    }
++}
++impl Drop for RestWatch {
++    fn drop(&mut self) {
++        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
++    }
++}
++
+ fn prepare_renderer_textures(pack: &PackResources) -> horizon_client::gfx::PreparedTextures {
+     let assets = &pack.render;
+     horizon_client::gfx::PreparedTextures::new(
+@@ -18491,6 +18661,13 @@ fn build_renderer(
+     // Chinese and Japanese menu labels go blank when the loading screen hands
+     // over to the game.
+     atlas.font.reset_cache();
++    // Low memory: the pack's and the atlas's CPU temporaries are dead by now,
++    // but mimalloc holds freed pages. Give them back before a second renderer
++    // (its pipelines, and the world's 80 MiB atlas) is built beside the
++    // loading screen's on a device where both count against the process.
++    horizon_threads::release_free_memory();
++    log::info!("Horizon: building the renderer, rss {} MiB", rss_mib());
++    let build_started = std::time::Instant::now();
+     let mut renderer = pollster::block_on(Renderer::new(
+         window,
+         offscreen,
+@@ -18501,6 +18678,7 @@ fn build_renderer(
+         &assets.sprite_mips,
+         &assets.animations,
+         (&atlas.pixels, atlas.width, atlas.height),
++        gui.atlas_file.as_deref(),
+         (&atlas.glint.0, atlas.glint.1, atlas.glint.2),
+         (
+             &atlas.glint_armor.0,
+@@ -18513,6 +18691,12 @@ fn build_renderer(
+         previous,
+         api,
+     ))?;
++    horizon_threads::release_free_memory();
++    log::info!(
++        "Horizon: renderer built in {} ms, rss {} MiB",
++        build_started.elapsed().as_millis(),
++        rss_mib()
++    );
+     renderer.hud.sprite_animations = atlas
+         .sprite_animations
+         .iter()
+@@ -18531,6 +18715,7 @@ fn loading_renderer(
+     window: Arc<Window>,
+     offscreen: bool,
+     atlas: Option<&horizon_client::hud::HudAtlas>,
++    atlas_file: Option<&std::path::Path>,
+     panorama: Option<&horizon_client::gfx::panorama::Faces>,
+     previous: Option<&Renderer>,
+     api: horizon_client::graphics::GraphicsApi,
+@@ -18566,6 +18751,7 @@ fn loading_renderer(
+         &[],
+         &[],
+         (pixels, width, height),
++        atlas_file,
+         (glint_pixels, glint_width, glint_height),
+         (glint_pixels, glint_width, glint_height),
+         (&FORCEFIELD[..], 1),
+@@ -18966,6 +19152,7 @@ impl Loading {
+             Some(&self.boot),
+             None,
+             None,
++            None,
+             self.settings.horizon.api,
+         ) {
+             Ok(r) => self.renderer = Some(r),
+@@ -19012,6 +19199,50 @@ impl Loading {
+         let Some(window) = self.window.clone() else {
+             return;
+         };
++        // A world or a server to open at start (quick play, --world, --server)
++        // means the menu is never shown: the loading screen keeps the small
++        // boot atlas and the pack's atlas goes to the GPU when the world
++        // renderer is built. Uploading it here would hold its texture through
++        // the world's table loads, which is where a 1 GB console runs out.
++        let auto = self
++            .options
++            .as_ref()
++            .is_some_and(|o| o.world.is_some() || o.server.is_some());
++        // Nothing reads the packed pixels after the upload, so spill them to
++        // the game folder and drop the copy (80 MiB on the default resources)
++        // instead of carrying it beside the world's tables. The renderer
++        // streams the texture back from the file (`UiResources::atlas_file`).
++        if let Some(gui) = self.gui.as_mut()
++            && gui.atlas.pixels.len() > 8 << 20
++            && let Ok(dir) = std::env::current_dir()
++        {
++            let path = dir.join("cache").join(format!(
++                "hud-atlas-{}x{}.rgba",
++                gui.atlas.width, gui.atlas.height
++            ));
++            let written = path
++                .parent()
++                .is_none_or(|parent| std::fs::create_dir_all(parent).is_ok())
++                && std::fs::write(&path, &gui.atlas.pixels).is_ok();
++            if written {
++                gui.atlas_file = Some(path.clone());
++                gui.atlas.pixels = Vec::new();
++                gui.atlas.pixels.shrink_to_fit();
++                horizon_threads::release_free_memory();
++                log::info!(
++                    "Horizon: shared atlas spilled to {} and its CPU copy dropped, rss {} MiB",
++                    path.display(),
++                    rss_mib()
++                );
++            }
++        }
++        if auto {
++            log::info!(
++                "Horizon: quick play, the loading screen keeps the boot atlas, rss {} MiB",
++                rss_mib()
++            );
++            return;
++        }
+         let offscreen = self.options.as_ref().is_some_and(|o| o.offscreen);
+         if let Some(renderer) = &mut self.renderer {
+             renderer.release_surface();
+@@ -19021,6 +19252,7 @@ impl Loading {
+             window,
+             offscreen,
+             Some(&bundle.atlas),
++            bundle.atlas_file.as_deref(),
+             Some(bundle.panorama.as_ref()),
+             self.renderer.as_ref(),
+             self.settings.horizon.api,
+@@ -19028,6 +19260,10 @@ impl Loading {
+             Ok(r) => {
+                 horizon_client::hud::GUI_SCALE.store(self.settings.gui_scale, Ordering::Relaxed);
+                 self.renderer = Some(r);
++                log::info!(
++                    "Horizon: loading screen shows the pack atlas, rss {} MiB",
++                    rss_mib()
++                );
+             }
+             Err(e) => self.error = Some(e),
+         }
+@@ -19098,12 +19334,16 @@ impl Loading {
+         // StartupMenu owns world selection until it can hand it to Game.
+         options.world = None;
+         options.server = None;
+-        let gui = self.gui.take().ok_or("missing menu bundle")?;
++        let mut gui = self.gui.take().ok_or("missing menu bundle")?;
+         let window = self.window.clone().ok_or("window closed")?;
+         // Keep the loader's device and swap in the real textures in one step.
+         if let Some(renderer) = &mut self.renderer {
+             renderer.release_surface();
+         }
++        // The core tables, the item models and the handoff left their parse
++        // buffers behind; give those pages back before the renderer's own
++        // peak (the sprite uploads and the title panorama) lands on them.
++        horizon_threads::release_free_memory();
+         let renderer_at = Instant::now();
+         let renderer = build_renderer(
+             window.clone(),
+@@ -19118,6 +19358,13 @@ impl Loading {
+             "Horizon: world renderer ready after {} ms",
+             self.started.elapsed().as_millis()
+         );
++        // The panorama's CPU faces and the prepared mip chains are gone now.
++        horizon_threads::release_free_memory();
++        // The atlas lives in the renderer's texture now. Its CPU copy is the
++        // largest single allocation left (80 MiB on the default resources),
++        // and every later renderer reuses that texture (same dimensions).
++        gui.atlas.pixels = Vec::new();
++        gui.atlas.pixels.shrink_to_fit();
+         let renderer_ms = renderer_at.elapsed().as_millis();
+         // Audio is created on the main thread, after the core is ready.
+         let audio = if !options.execution_role.is_client() {
+@@ -19322,10 +19569,133 @@ fn run_loading(
+ 
+ pub use launch_api::{UsageError, exit_code};
+ 
++/// `--bake-atlas`: pack the GUI atlas exactly as a world start does, then write
++/// its ASTC cache with the encoder the port ships. `patch.bash` runs it once
++/// per install, on the CPU: no window, no GPU, no world, no event loop.
++fn bake_atlas(options: &Options, vanilla_root: &std::path::Path) -> Result<()> {
++    let started = Instant::now();
++    let settings = Settings::load(&std::env::current_dir()?.join("options.txt"));
++    let root = packs::startup_root(vanilla_root, &settings.resource_packs, &[]).unwrap_or_else(
++        |e| {
++            log::warn!("Horizon: resource packs not applied: {e}");
++            vanilla_root.to_path_buf()
++        },
++    );
++    let root = mods::content_root(&root, &settings.mods.enabled, &options.dev_mods);
++    let encoder = options
++        .astcenc
++        .clone()
++        .or_else(horizon_client::astc::find_encoder)
++        .ok_or("--bake-atlas has no encoder: pass --astcenc PATH or ship tools/astcenc")?;
++    let atlas = horizon_client::hud::HudAtlas::build_over(&root, vanilla_root)
++        .map_err(|e| e.to_string())?;
++    log::info!(
++        "Horizon: baked atlas source {}x{} from {} ({} MiB), packed in {:.1} s",
++        atlas.width,
++        atlas.height,
++        root.display(),
++        u64::from(atlas.width) * u64::from(atlas.height) * 4 / (1024 * 1024),
++        started.elapsed().as_secs_f32()
++    );
++    let dir = std::env::current_dir()?.join("cache");
++    std::fs::create_dir_all(&dir)?;
++    let path = dir.join(format!("hud-atlas-{}x{}.astc", atlas.width, atlas.height));
++    let started = Instant::now();
++    horizon_client::astc::encode(&encoder, &atlas.pixels, atlas.width, atlas.height, &path)
++        .map_err(|e| e.to_string())?;
++    let bytes = std::fs::metadata(&path).map_or(0, |m| m.len());
++    log::info!(
++        "Horizon: baked {} ({} MiB, {:.1} bpp) with {} in {:.1} s",
++        path.display(),
++        bytes / (1024 * 1024),
++        (bytes * 8) as f64 / (f64::from(atlas.width) * f64::from(atlas.height)),
++        encoder.display(),
++        started.elapsed().as_secs_f32()
++    );
++    println!("{}", path.display());
++    // The block sprite arrays, packed exactly as the renderer packs them at
++    // startup, so the renderer finds a bake that matches its bytes.
++    match bake_sprites(root, vanilla_root, &settings, &encoder, &dir) {
++        Ok(()) => {}
++        Err(error) => log::warn!("Horizon: block sprite arrays not baked: {error}"),
++    }
++    Ok(())
++}
++
++/// Bake the block sprite arrays' ASTC caches. Needs the pack the renderer
++/// packs its sprites from, so it loads the core tables (without a window, a
++/// world or the UI atlas) and prepares the same textures the renderer would.
++fn bake_sprites(
++    root: PathBuf,
++    vanilla_root: &std::path::Path,
++    settings: &Settings,
++    encoder: &std::path::Path,
++    dir: &std::path::Path,
++) -> Result<()> {
++    let started = Instant::now();
++    let progress = Progress::new();
++    let mut publish = |_: UiResources, _: &std::path::Path| {};
++    let loaded = load_resources(
++        root,
++        None,
++        vanilla_root,
++        settings,
++        started,
++        false,
++        true,
++        true,
++        &progress,
++        &mut publish,
++    )?;
++    // A pack read for a server holds no pixels: a bake of it would be a
++    // transparent array the renderer's key never matches.
++    if loaded.pack.render.pixels.is_empty() {
++        return Err("no block sprite pixels in this pack".into());
++    }
++    // The bake outlives the Mipmap Levels option that shaped this run, so it
++    // is built with the whole chain the format can hold (down to one block)
++    // rather than with the option's count. The loader reads the prefix the
++    // option asks for, so one bake serves every value of it.
++    let bake_size = loaded.pack.render.sprite_size;
++    horizon_client::sprites::set_mip_levels(horizon_client::astc::max_levels(bake_size));
++    let prepared = prepare_renderer_textures(&loaded.pack);
++    let mut total = 0;
++    for (_array, size, layers, levels, bytes) in prepared.arrays() {
++        let key = horizon_client::astc::pack_key(size, std::iter::once((bytes, levels)));
++        let path = horizon_client::astc::array_path(dir, size, layers, levels, key);
++        let started = Instant::now();
++        horizon_client::astc::encode_array(encoder, bytes, size, layers, levels, &path)
++            .map_err(|e| e.to_string())?;
++        let written = std::fs::metadata(&path).map_or(0, |m| m.len());
++        total += written;
++        log::info!(
++            "Horizon: baked {} ({} layers at {size}px, {levels} mip levels, {} KiB) in {:.1} s",
++            path.display(),
++            layers,
++            written / 1024,
++            started.elapsed().as_secs_f32()
++        );
++        println!("{}", path.display());
++    }
++    log::info!(
++        "Horizon: baked the block sprite arrays ({} MiB) from {}",
++        total / (1024 * 1024),
++        loaded.root.display()
++    );
++    Ok(())
++}
+ pub fn run() -> Result<()> {
+     let Some(mut options) = Options::read()? else {
+         return Ok(());
+     };
++    if options.bake_atlas {
++        // Before anything opens a window, a world or a device.
++        let vanilla_root = options.resources.clone();
++        if let Some(error) = missing_resources(&vanilla_root) {
++            return Err(error.into());
++        }
++        return bake_atlas(&options, &vanilla_root);
++    }
+     if options.execution_role == execution_role::ExecutionRole::DedicatedServer
+         && !dedicated::preflight(&mut options)?
+     {
+@@ -19412,6 +19782,7 @@ pub fn run() -> Result<()> {
+         started,
+         false,
+         options.dedicated.is_some(),
++        false,
+         &Progress::new(),
+         &mut |_, _| {},
+     )?;
+diff --git a/crates/horizon-client/src/game/no_resources.rs b/crates/horizon-client/src/game/no_resources.rs
+index 634b8db..9604bb5 100644
+--- a/crates/horizon-client/src/game/no_resources.rs
++++ b/crates/horizon-client/src/game/no_resources.rs
+@@ -24,6 +24,7 @@ pub(super) fn show(looked_in: &std::path::Path, settings: &Settings) -> Result<(
+         renderer: None,
+         gui: UiResources {
+             atlas: HudAtlas::build(looked_in)?,
++            atlas_file: None,
+             panorama: Arc::new(horizon_client::gfx::panorama::Faces {
+                 size: 1,
+                 pixels: [0u8; 4].repeat(6),
+@@ -109,6 +110,7 @@ impl ApplicationHandler for Missing {
+                     window.clone(),
+                     false,
+                     Some(&self.gui.atlas),
++                    self.gui.atlas_file.as_deref(),
+                     Some(self.gui.panorama.as_ref()),
+                     None,
+                     self.api,
+diff --git a/crates/horizon-client/src/game/packs.rs b/crates/horizon-client/src/game/packs.rs
+index 965ae08..9e0171a 100644
+--- a/crates/horizon-client/src/game/packs.rs
++++ b/crates/horizon-client/src/game/packs.rs
+@@ -408,6 +408,7 @@ pub(super) fn stage_pack(
+     atlas.font.japanese = japanese;
+     let gui = UiResources {
+         atlas,
++        atlas_file: None,
+         panorama: Arc::new(panorama.unwrap_or_else(|p| std::panic::resume_unwind(p))),
+     };
+     progress.set(2);
+diff --git a/crates/horizon-client/src/game/startup_menu.rs b/crates/horizon-client/src/game/startup_menu.rs
+index 3aa253c..9dbc3fc 100644
+--- a/crates/horizon-client/src/game/startup_menu.rs
++++ b/crates/horizon-client/src/game/startup_menu.rs
+@@ -358,6 +358,7 @@ pub(super) fn spawn_loader(
+                 started,
+                 true,
+                 false,
++                false,
+                 &progress,
+                 &mut |gui, root| {
+                     let _ = sender.send(LoaderMsg::Ui(gui, root.to_path_buf()));
+diff --git a/crates/horizon-client/src/game/stations.rs b/crates/horizon-client/src/game/stations.rs
+index 0c2026e..e09dce4 100644
+--- a/crates/horizon-client/src/game/stations.rs
++++ b/crates/horizon-client/src/game/stations.rs
+@@ -1392,15 +1392,7 @@ impl Game<'_> {
+                 }
+                 let (col, row) = (code % 16, code / 16);
+                 let (cx, cy) = (px + col * cell, py + row * cell);
+-                let mut used = 0;
+-                for dx in (0..cell).rev() {
+-                    if (0..cell).any(|dy| {
+-                        atlas.pixels[(((cy + dy) * atlas.width + cx + dx) * 4 + 3) as usize] != 0
+-                    }) {
+-                        used = dx + 1;
+-                        break;
+-                    }
+-                }
++                let used = atlas.galactic[code as usize] as u32;
+                 let advance = (used as f32 * 8.0 / cell as f32 + 0.5).floor() + 1.0;
+                 if cursor + advance - x > max {
+                     break;
+diff --git a/crates/horizon-client/src/lib.rs b/crates/horizon-client/src/lib.rs
+index 7904eef..360dbb3 100644
+--- a/crates/horizon-client/src/lib.rs
++++ b/crates/horizon-client/src/lib.rs
+@@ -7,7 +7,8 @@ pub mod animate_tick;
+ pub mod arrows;
+ pub mod block_contact;
+ pub use horizon_client_render::{
+-    assets, atlas_sources, audio, auth, ban_notice, bidi, biome, block_entities, block_entity_anim,
++    assets, astc, atlas_sources, audio, auth, ban_notice, bidi, biome, block_entities,
++    block_entity_anim,
+     block_entity_render, border_render, breaking, brewing, camera, chat, chunk, chunk_map, clouds,
+     collisions, command_block, containers, crash, datapack, dynamic_light, effects, environment,
+     extras, fast_hash, fog, font, gfx, graphics, graphics_style, graphics_ui, hdr_calibration, hud,
+diff --git a/crates/horizon-items/src/items.rs b/crates/horizon-items/src/items.rs
+index db39cdd..0b9807e 100644
+--- a/crates/horizon-items/src/items.rs
++++ b/crates/horizon-items/src/items.rs
+@@ -362,6 +362,15 @@ fn registry_order(root: &Path, order: &[Arc<str>]) -> Vec<Arc<str>> {
+ }
+ /// Item ids standing for a loot table's `minecraft:dynamic` entries.
+ const DYNAMIC: &str = "#dynamic:";
++/// The process's resident set in MiB, for the load's memory logs.
++fn load_rss(stage: &str) {
++    let rss = std::fs::read_to_string("/proc/self/statm")
++        .ok()
++        .and_then(|s| s.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok()))
++        .map(|pages| pages * 4 / 1024)
++        .unwrap_or(0);
++    eprintln!("Horizon: items {stage}, rss {rss} MiB");
++}
+ pub struct Items {
+     pub items: HashMap<Arc<str>, ItemInfo>,
+     pub order: Vec<Arc<str>>,
+@@ -899,23 +908,39 @@ impl Items {
+             );
+             order.push(id);
+         }
++        load_rss("item defaults");
+         // Every loot table, keyed by its id (blocks/stone, entities/sheep/white,
+         // gameplay/chicken_lay, shearing/sheep/red...), of every namespace
+         // (content mods' tables, docs/modpacks.md), with the packs' over the
+         // game's own: one map with the loot data of the same root and packs.
+-        let loot = horizon_world::loot::shared_tables(root, overlay)?;
++        // Parsed JSON is the load's biggest table set; `HORIZON_SKIP_LOOT`
++        // leaves it empty for a test that measures what it costs.
++        let loot = if std::env::var_os("HORIZON_SKIP_LOOT").is_some() {
++            Arc::new(HashMap::new())
++        } else {
++            horizon_world::loot::shared_tables(root, overlay)?
++        };
++        load_rss("loot tables");
+         let registry_order = registry_order(root, &order);
++        let block_tags = load_tags(root, "block", overlay)?;
++        let item_tags = load_tags(root, "item", overlay)?;
++        let item_tag_order = load_tag_lists(root, "item", overlay)?;
++        load_rss("tags");
++        let songs = load_songs(root);
++        let instruments = load_instruments(root);
++        let enchantments = Arc::new(crate::enchant::Enchantments::load_with(root, overlay));
++        load_rss("enchantments");
+         Ok(Self {
+             items,
+             order,
+             registry_order,
+-            block_tags: load_tags(root, "block", overlay)?,
+-            item_tags: load_tags(root, "item", overlay)?,
+-            item_tag_order: load_tag_lists(root, "item", overlay)?,
++            block_tags,
++            item_tags,
++            item_tag_order,
+             loot,
+-            songs: load_songs(root),
+-            instruments: load_instruments(root),
+-            enchantments: Arc::new(crate::enchant::Enchantments::load_with(root, overlay)),
++            songs,
++            instruments,
++            enchantments,
+         })
+     }
+     pub fn get(&self, id: &str) -> Option<&ItemInfo> {
+diff --git a/crates/horizon-world/Cargo.toml b/crates/horizon-world/Cargo.toml
+index 89f82bb..484c0ff 100644
+--- a/crates/horizon-world/Cargo.toml
++++ b/crates/horizon-world/Cargo.toml
+@@ -13,6 +13,7 @@ serde = { version = "1", features = ["derive"] }
+ sha2 = "0.10"
+ postcard = { version = "=1.1.3", default-features = false, features = ["alloc"] }
+ horizon-core = { path = "../horizon-core" }
++horizon-threads = { path = "../horizon-threads" }
+ flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs", "runtime_detection"] }
+ lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"] }
+ xxhash-rust = { version = "0.8.19", features = ["xxh32"] }
+diff --git a/crates/horizon-world/src/worldgen/generator.rs b/crates/horizon-world/src/worldgen/generator.rs
+index a2fbee9..e2468bc 100644
+--- a/crates/horizon-world/src/worldgen/generator.rs
++++ b/crates/horizon-world/src/worldgen/generator.rs
+@@ -458,6 +458,7 @@ impl GeneratorData {
+             .into_iter()
+             .filter_map(|(key, integer)| integer.then_some(key))
+             .collect();
++        horizon_threads::release_free_memory();
+         let biomes = read_bundle(dir, ov, "biomes")?;
+         let biome_tags = build_tags(
+             &read_bundle(dir, ov, "biome_tags")?,
+@@ -492,6 +493,7 @@ impl GeneratorData {
+         let source_catalog =
+             BiomeSourceCatalog::new(&biome_set, &biome_tags, &presets.keys().cloned().collect())?;
+         let carvers = CarverCatalog::from_json(&read_bundle(dir, ov, "carvers")?)?;
++        horizon_threads::release_free_memory();
+         let mut biome_names = Vec::new();
+         let mut biome_ids = BTreeMap::new();
+         let mut biome_json = Vec::new();
+@@ -529,6 +531,7 @@ impl GeneratorData {
+             _ => None,
+         };
+         let structures = joined(structures)?;
++        horizon_threads::release_free_memory();
+         let structure_resources = match (
+             read_optional_bundle(dir, ov, "structures")?,
+             read_optional_bundle(dir, ov, "structure_sets")?,
+@@ -542,6 +545,7 @@ impl GeneratorData {
+             _ => None,
+         };
+         let behaviours = joined(behaviours);
++        horizon_threads::release_free_memory();
+         Ok(Arc::new(Self {
+             behaviours,
+             structure_resources,
+diff --git a/crates/horizon-world/src/worldgen/generator_blocks.rs b/crates/horizon-world/src/worldgen/generator_blocks.rs
+index 7498b9e..e5047f9 100644
+--- a/crates/horizon-world/src/worldgen/generator_blocks.rs
++++ b/crates/horizon-world/src/worldgen/generator_blocks.rs
+@@ -128,6 +128,7 @@ impl BlockBehavior {
+                 .unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
+             Ok::<_, GeneratorError>((collisions, properties, Arc::new(support)))
+         })?;
++        horizon_threads::release_free_memory();
+         let collision = Arc::new(BlockCollisionRegistry::new(Arc::new(collisions))?);
+         let rules = json("survival-rules.json")?
+             .as_object()
+-- 
+2.43.0
+

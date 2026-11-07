@@ -1,0 +1,56 @@
+From f87f3640d4abcfbcfe54c3f69ec30bbf44aac39d Mon Sep 17 00:00:00 2001
+From: Knifethrower <andersenpeters@gmail.com>
+Date: Fri, 6 Nov 2026 01:46:45 -0500
+Subject: [PATCH 41/41] tutorial: end it once a gamepad is playing
+
+Hypothesis: the tutorial's popups name the keyboard and the mouse, and turning with a stick goes through
+`pad_look`, which never tells the tutorial. So on a handheld "Look around" never closes, and the
+"Move with W, A, S and D" and "Use your mouse to turn" hints stay on screen for good.
+
+Change: once the pad has driven the game, the tutorial ends the way its last step does, and that's
+persisted the way each of its steps is. So `tutorialStep` in options.txt becomes none, like any player
+who finished it. A player on keyboard and mouse keeps the tutorial.
+
+Number: popups on screen after moving with a pad: before, always (seen on the R36S). After, none.
+
+Falsified by: a tutorial popup on screen after the pad has been used.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/horizon-client/src/game/tutorial.rs | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/crates/horizon-client/src/game/tutorial.rs b/crates/horizon-client/src/game/tutorial.rs
+index bb77cda..0e01a48 100644
+--- a/crates/horizon-client/src/game/tutorial.rs
++++ b/crates/horizon-client/src/game/tutorial.rs
+@@ -82,6 +82,11 @@ impl Tutorial {
+         true
+     }
+ 
++    /// The tutorial is over, as when its last step ends. Returns whether the persisted step changed.
++    pub(super) fn finish(&mut self) -> bool {
++        self.set_step(Step::None)
++    }
++
+     pub(super) fn input(&mut self) {
+         self.moved = true;
+     }
+@@ -257,6 +262,14 @@ impl super::Game<'_> {
+         {
+             return;
+         }
++        // Its hints name the keyboard and the mouse, and a stick's turning doesn't count as looking
++        // around, so with a pad its first step could never end.
++        if self.pad.in_use {
++            if self.tutorial.finish() {
++                self.persist_tutorial_step();
++            }
++            return;
++        }
+         if self.screen == super::Screen::Playing
+             && ([
+                 KeyCode::KeyW,
+-- 
+2.43.0
+

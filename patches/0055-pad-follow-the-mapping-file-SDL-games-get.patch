@@ -1,0 +1,107 @@
+From dd338c3768e9c6928dfd1ff9709e970728c02c1b Mon Sep 17 00:00:00 2001
+From: Knifethrower <andersenpeters@gmail.com>
+Date: Sat, 7 Nov 2026 03:11:45 -0500
+Subject: [PATCH] pad: follow the mapping file SDL games get
+
+Hypothesis: A, B, X and Y are swapped on a handheld whose system lays them out by their printed labels, because
+gilrs takes the pad's row from the SDL database it bundles and never reads SDL_GAMECONTROLLERCONFIG_FILE. On the
+R36S the bundled row has a:b0,b:b1,x:b3,y:b2 and PortMaster's has a:b1,b:b0,x:b2,y:b3.
+
+Change: first thing in main, put the file's rows in SDL_GAMECONTROLLERCONFIG, the one source gilrs lets win over
+its database. No file, or an empty one, changes nothing. The helper that sets it is in horizon-threads, because
+this crate forbids unsafe code and setting the environment is unsafe in this edition.
+
+Number: on an R36S with a virtual copy of its pad (same name, ids and event codes), the right button, labeled A, now
+confirms and the bottom one, labeled B, doesn't, where before it was the reverse. The left one, labeled Y, opens the
+inventory, and the top one, labeled X, swaps hands.
+
+Falsifier: the same run without SDL_GAMECONTROLLERCONFIG_FILE should behave as before the patch. If it doesn't, something
+else moved the buttons.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/horizon-client-input/src/gamepad.rs | 17 +++++++++++++++++
+ crates/horizon-client/src/main.rs          | 17 +++++++++++++++++
+ crates/horizon-threads/src/lib.rs          |  7 +++++++
+ 3 files changed, 41 insertions(+)
+
+diff --git a/crates/horizon-client-input/src/gamepad.rs b/crates/horizon-client-input/src/gamepad.rs
+index 4e195f4..8a67b9d 100644
+--- a/crates/horizon-client-input/src/gamepad.rs
++++ b/crates/horizon-client-input/src/gamepad.rs
+@@ -1159,10 +1159,27 @@ pub fn bow_power(ticks: u32) -> f32 {
+     ((f * f + f * 2.0) / 3.0).min(1.0)
+ }
+ 
++/// `SDL_GAMECONTROLLERCONFIG` with a mapping file's rows in it, or `None` when the file has none. The
++/// last row for a pad wins, so the variable's own rows stay ahead of the file's, as in SDL.
++pub fn sdl_config_with_file(file_rows: &str, config: Option<&str>) -> Option<String> {
++    if file_rows.trim().is_empty() {
++        return None;
++    }
++    Some(format!("{file_rows}\n{}", config.unwrap_or("")))
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn a_mapping_file_comes_before_the_variables_rows() {
++        assert_eq!(sdl_config_with_file("", None), None);
++        assert_eq!(sdl_config_with_file(" \n", Some("row")), None);
++        assert_eq!(sdl_config_with_file("file", None).as_deref(), Some("file\n"));
++        assert_eq!(sdl_config_with_file("file", Some("own")).as_deref(), Some("file\nown"));
++    }
++
+     #[test]
+     fn defaults_follow_bedrock() {
+         let s = PadSettings::default();
+diff --git a/crates/horizon-client/src/main.rs b/crates/horizon-client/src/main.rs
+index 2167526..4604ff3 100644
+--- a/crates/horizon-client/src/main.rs
++++ b/crates/horizon-client/src/main.rs
+@@ -12,8 +12,25 @@ static ALLOCATOR: horizon_threads::Allocator = horizon_threads::Allocator;
+ /// reads it, so the linker keeps it.
+ static MOD_API_LEVEL: [u8; 27] = horizon_mods::api_level::MARK;
+ 
++/// SDL games get this machine's pad layout from `SDL_GAMECONTROLLERCONFIG_FILE`. gilrs doesn't read
++/// that file, and only `SDL_GAMECONTROLLERCONFIG` wins over the SDL database it bundles, so the file's
++/// rows go in that variable. Before any thread starts.
++fn adopt_sdl_mapping_file() {
++    let Some(file) = std::env::var_os("SDL_GAMECONTROLLERCONFIG_FILE") else {
++        return;
++    };
++    let Ok(rows) = std::fs::read_to_string(file) else {
++        return;
++    };
++    let config = std::env::var("SDL_GAMECONTROLLERCONFIG").ok();
++    if let Some(config) = horizon_client::gamepad::sdl_config_with_file(&rows, config.as_deref()) {
++        horizon_threads::set_env_before_threads("SDL_GAMECONTROLLERCONFIG", &config);
++    }
++}
++
+ fn main() {
+     horizon_threads::configure_allocator();
++    adopt_sdl_mapping_file();
+     std::hint::black_box(&MOD_API_LEVEL);
+     horizon_client::telemetry::mark_start();
+     let args: Vec<String> = std::env::args().skip(1).collect();
+diff --git a/crates/horizon-threads/src/lib.rs b/crates/horizon-threads/src/lib.rs
+index c3020f2..d9a5d34 100644
+--- a/crates/horizon-threads/src/lib.rs
++++ b/crates/horizon-threads/src/lib.rs
+@@ -492,3 +492,10 @@ mod junction_tests {
+         assert!(super::mount_point_buffer(&[0; 100]).is_ok());
+     }
+ }
++
++/// Sets an environment variable, for the first lines of `main` only: once another thread can read
++/// the environment, setting it isn't safe.
++pub fn set_env_before_threads(key: &str, value: &str) {
++    // SAFETY: the caller is `main`, before it has started a thread.
++    unsafe { std::env::set_var(key, value) };
++}
+-- 
+2.43.0
+

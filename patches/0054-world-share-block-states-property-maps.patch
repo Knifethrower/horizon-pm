@@ -1,0 +1,276 @@
+From ba3eca1ab720ed2e1355d6dffea3935eccd40566 Mon Sep 17 00:00:00 2001
+From: Knifethrower <andersenpeters@gmail.com>
+Date: Fri, 6 Nov 2026 18:28:36 -0500
+Subject: [PATCH 54/54] world: share block states' property maps
+
+Hypothesis: the block registry's 35,723 states each own a BTreeMap, and even a map with one entry takes a whole
+node of over 500 bytes: 19 MiB, the largest single thing in the game's heap. Most of those maps are equal to
+another state's: every stairs block has the same 80.
+
+Change: BlockState.properties is Properties, a map behind an Arc that reads like the map and copies on write,
+and BlockRegistry::from_states gives equal maps one allocation. Everything else that reads or edits a state's
+properties compiles as it was.
+
+Number: the game's heap at rest on an R36S, 292 to 271 MB.
+
+Falsifier: a state's properties change when another state's are edited.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/horizon-client/src/game/blockctl.rs    |  5 +-
+ .../src/game/machines/native_fluids.rs        |  2 +-
+ .../horizon-client/src/game/sculk_fixture.rs  |  4 +-
+ crates/horizon-client/src/save/gateway.rs     |  2 +-
+ crates/horizon-world/src/chunk.rs             | 77 ++++++++++++++++++-
+ .../horizon-world/src/level/growth_tests.rs   |  3 +-
+ crates/horizon-world/src/level/tests.rs       |  3 +-
+ crates/horizon-world/src/registry.rs          | 10 ++-
+ crates/horizon-world/src/registry/facts.rs    |  4 +-
+ 9 files changed, 96 insertions(+), 14 deletions(-)
+
+diff --git a/crates/horizon-client/src/game/blockctl.rs b/crates/horizon-client/src/game/blockctl.rs
+index 52385ee..2c7a02f 100644
+--- a/crates/horizon-client/src/game/blockctl.rs
++++ b/crates/horizon-client/src/game/blockctl.rs
+@@ -28,7 +28,10 @@ fn parse_state(text: &str) -> Result<BlockState> {
+         let (k, v) = pair.split_once('=').ok_or("properties are key=value")?;
+         properties.insert(k.to_owned(), v.to_owned());
+     }
+-    Ok(BlockState { name, properties })
++    Ok(BlockState {
++        name,
++        properties: properties.into(),
++    })
+ }
+ 
+ impl Game<'_> {
+diff --git a/crates/horizon-client/src/game/machines/native_fluids.rs b/crates/horizon-client/src/game/machines/native_fluids.rs
+index b66e46e..46c4fba 100644
+--- a/crates/horizon-client/src/game/machines/native_fluids.rs
++++ b/crates/horizon-client/src/game/machines/native_fluids.rs
+@@ -183,7 +183,7 @@ impl Game<'_> {
+         }
+         let state = horizon_world::chunk::BlockState {
+             name: name.to_owned(),
+-            properties,
++            properties: properties.into(),
+         };
+         match self.pack.assets.registry.resolve(&state) {
+             Ok(id) => self.level_set(pos, id).is_ok(),
+diff --git a/crates/horizon-client/src/game/sculk_fixture.rs b/crates/horizon-client/src/game/sculk_fixture.rs
+index 92a73ad..a0adc2a 100644
+--- a/crates/horizon-client/src/game/sculk_fixture.rs
++++ b/crates/horizon-client/src/game/sculk_fixture.rs
+@@ -187,7 +187,7 @@ impl Game<'_> {
+             .ok_or_else(|| format!("unknown block {name}"))?;
+         let mut properties: BTreeMap<String, String> = registry
+             .state(base)
+-            .map(|s| s.properties.clone().into_iter().collect())
++            .map(|s| (*s.properties).clone())
+             .unwrap_or_default();
+         for kv in props.split(',').filter(|s| !s.is_empty()) {
+             let (k, v) = kv.split_once('=').ok_or("property")?;
+@@ -195,7 +195,7 @@ impl Game<'_> {
+         }
+         Ok(registry.resolve(&BlockState {
+             name: name.to_owned(),
+-            properties,
++            properties: properties.into(),
+         })?)
+     }
+ 
+diff --git a/crates/horizon-client/src/save/gateway.rs b/crates/horizon-client/src/save/gateway.rs
+index baea821..6e97b29 100644
+--- a/crates/horizon-client/src/save/gateway.rs
++++ b/crates/horizon-client/src/save/gateway.rs
+@@ -194,7 +194,7 @@ mod tests {
+                 BlockPos::new(1, 75, 1),
+                 BlockState {
+                     name: "minecraft:air".into(),
+-                    properties: BTreeMap::new(),
++                    properties: Default::default(),
+                 },
+             )
+             .unwrap();
+diff --git a/crates/horizon-world/src/chunk.rs b/crates/horizon-world/src/chunk.rs
+index 0b804bd..8a869bf 100644
+--- a/crates/horizon-world/src/chunk.rs
++++ b/crates/horizon-world/src/chunk.rs
+@@ -12,7 +12,7 @@ use horizon_core::{
+     storage::PackedStorage,
+     ticks::{ChunkTicks, SavedTick, TickTypeId},
+ };
+-use std::{collections::BTreeMap, io};
++use std::{collections::BTreeMap, io, sync::Arc};
+ 
+ fn key(value: &str) -> JavaString {
+     JavaString::from(value)
+@@ -158,10 +158,79 @@ impl PalettedContainer {
+     }
+ }
+ 
++/// A block state's properties: a map behind a shared pointer. Most states have the same
++/// properties as a state of another block, every stairs block's as the next one's, and an empty
++/// map's node alone is hundreds of bytes per state. Reads go through to the map; a write copies it
++/// if another state shares it.
++#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
++pub struct Properties(Arc<BTreeMap<String, String>>);
++impl std::ops::Deref for Properties {
++    type Target = BTreeMap<String, String>;
++    fn deref(&self) -> &Self::Target {
++        &self.0
++    }
++}
++impl std::ops::DerefMut for Properties {
++    fn deref_mut(&mut self) -> &mut Self::Target {
++        Arc::make_mut(&mut self.0)
++    }
++}
++impl From<BTreeMap<String, String>> for Properties {
++    fn from(map: BTreeMap<String, String>) -> Self {
++        Self(Arc::new(map))
++    }
++}
++impl<const N: usize> From<[(String, String); N]> for Properties {
++    fn from(entries: [(String, String); N]) -> Self {
++        BTreeMap::from(entries).into()
++    }
++}
++impl FromIterator<(String, String)> for Properties {
++    fn from_iter<I: IntoIterator<Item = (String, String)>>(entries: I) -> Self {
++        entries.into_iter().collect::<BTreeMap<_, _>>().into()
++    }
++}
++impl<'a> IntoIterator for &'a Properties {
++    type Item = (&'a String, &'a String);
++    type IntoIter = std::collections::btree_map::Iter<'a, String, String>;
++    fn into_iter(self) -> Self::IntoIter {
++        self.0.iter()
++    }
++}
++#[cfg(test)]
++mod properties_tests {
++    use super::*;
++    #[test]
++    fn a_write_leaves_the_state_it_shared_with_alone() {
++        let first = Properties::from([("half".to_owned(), "top".to_owned())]);
++        let mut second = first.clone();
++        assert!(Arc::ptr_eq(&first.0, &second.0));
++        second.insert("half".to_owned(), "bottom".to_owned());
++        assert!(!Arc::ptr_eq(&first.0, &second.0));
++        assert_eq!(first["half"], "top");
++        assert_eq!(second["half"], "bottom");
++    }
++}
++impl PartialEq<BTreeMap<String, String>> for Properties {
++    fn eq(&self, other: &BTreeMap<String, String>) -> bool {
++        *self.0 == *other
++    }
++}
++impl<'de> serde::Deserialize<'de> for Properties {
++    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
++        BTreeMap::deserialize(deserializer).map(Self::from)
++    }
++}
++impl serde::Serialize for Properties {
++    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
++        self.0.serialize(serializer)
++    }
++}
++
+ #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+ pub struct BlockState {
+     pub name: String,
+-    pub properties: BTreeMap<String, String>,
++    pub properties: Properties,
+ }
+ impl BlockState {
+     pub fn to_nbt(&self) -> Tag {
+@@ -184,7 +253,7 @@ impl BlockState {
+         if let Tag::String(name) = tag {
+             return Ok(Self {
+                 name: name.to_string().map_err(|e| invalid(e.to_string()))?,
+-                properties: BTreeMap::new(),
++                properties: Properties::default(),
+             });
+         }
+         let Some(Tag::String(name)) = tag.get("id") else {
+@@ -207,7 +276,7 @@ impl BlockState {
+         }
+         Ok(Self {
+             name: name.to_string().map_err(|e| invalid(e.to_string()))?,
+-            properties,
++            properties: properties.into(),
+         })
+     }
+ }
+diff --git a/crates/horizon-world/src/level/growth_tests.rs b/crates/horizon-world/src/level/growth_tests.rs
+index a316aae..67ddfa6 100644
+--- a/crates/horizon-world/src/level/growth_tests.rs
++++ b/crates/horizon-world/src/level/growth_tests.rs
+@@ -121,7 +121,8 @@ impl World {
+             properties: props
+                 .iter()
+                 .map(|(k, v)| (k.to_string(), v.to_string()))
+-                .collect::<BTreeMap<_, _>>(),
++                .collect::<BTreeMap<_, _>>()
++                .into(),
+         };
+         self.f
+             .registry
+diff --git a/crates/horizon-world/src/level/tests.rs b/crates/horizon-world/src/level/tests.rs
+index 0237eb2..f269e43 100644
+--- a/crates/horizon-world/src/level/tests.rs
++++ b/crates/horizon-world/src/level/tests.rs
+@@ -184,7 +184,8 @@ impl<'f> World<'f> {
+             properties: props
+                 .iter()
+                 .map(|(k, v)| (k.to_string(), v.to_string()))
+-                .collect::<BTreeMap<_, _>>(),
++                .collect::<BTreeMap<_, _>>()
++                .into(),
+         };
+         self.f
+             .registry
+diff --git a/crates/horizon-world/src/registry.rs b/crates/horizon-world/src/registry.rs
+index 8b6c94c..cc80e67 100644
+--- a/crates/horizon-world/src/registry.rs
++++ b/crates/horizon-world/src/registry.rs
+@@ -92,7 +92,15 @@ impl BlockRegistry {
+             collided: BTreeMap::new(),
+             defaults: BTreeMap::new(),
+         };
+-        for (i, state) in states.into_iter().enumerate() {
++        // One map per distinct set of properties: most states share theirs with another block's.
++        let mut shared = std::collections::HashSet::new();
++        for (i, mut state) in states.into_iter().enumerate() {
++            match shared.get(&state.properties) {
++                Some(same) => state.properties = crate::chunk::Properties::clone(same),
++                None => {
++                    shared.insert(state.properties.clone());
++                }
++            }
+             if result.id(&state).is_some() {
+                 return Err(invalid("duplicate block registry state"));
+             }
+diff --git a/crates/horizon-world/src/registry/facts.rs b/crates/horizon-world/src/registry/facts.rs
+index 3371a82..2b872eb 100644
+--- a/crates/horizon-world/src/registry/facts.rs
++++ b/crates/horizon-world/src/registry/facts.rs
+@@ -66,11 +66,11 @@ impl<'de> Deserialize<'de> for State {
+         Ok(State(match Shape::deserialize(deserializer)? {
+             Shape::Name(name) => BlockState {
+                 name,
+-                properties: BTreeMap::new(),
++                properties: Default::default(),
+             },
+             Shape::Full { id, properties } => BlockState {
+                 name: id,
+-                properties,
++                properties: properties.into(),
+             },
+         }))
+     }
+-- 
+2.43.0
+
