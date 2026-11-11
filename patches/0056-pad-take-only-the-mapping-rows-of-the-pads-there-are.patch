@@ -1,0 +1,168 @@
+From 47fd9ba5af3efe4c98d2d3a6f6aa184ca21bfb44 Mon Sep 17 00:00:00 2001
+From: Knifethrower <andersenpeters@gmail.com>
+Date: Wed, 11 Nov 2026 00:12:03 -0500
+Subject: [PATCH] pad: take only the mapping rows of the pads there are
+
+Hypothesis: on muOS every program the game starts fails with E2BIG (the atlas bake's astcenc first), because the
+previous patch copies the whole SDL_GAMECONTROLLERCONFIG_FILE into SDL_GAMECONTROLLERCONFIG, and there that file is
+the whole SDL database, about 595 KB. Linux refuses to start a program when one environment string is over 128 KiB.
+
+Change: read the bus type, vendor, product and version of each device under /sys/class/input, build SDL's GUID from
+them, and keep only the file's rows whose GUID is one of those. The variable's own rows still come after the file's.
+A file with no row for any device present changes nothing, as an empty one did.
+
+Number: unit test on a file of 6000 other rows (over 128 KiB) with one row for the R36S pad in the middle: the result
+is that one row. sdl_guid gives 190000004b4800000011000000010000 for bus 0x19, vendor 0x484b, product 0x1100,
+version 0x100, the GUID of that row in PortMaster's file. Not yet run on a handheld.
+
+Falsifier: on muOS with this build, `--bake-atlas` should start astcenc and finish. If it still fails with E2BIG,
+another environment string is too long. On the R36S the buttons should stay as the previous patch set them; if A
+and B swap back, the GUID from sysfs doesn't match the file's row.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/horizon-client-input/src/gamepad.rs | 66 +++++++++++++++++++---
+ crates/horizon-client/src/main.rs          | 29 +++++++++-
+ 2 files changed, 85 insertions(+), 10 deletions(-)
+
+diff --git a/crates/horizon-client-input/src/gamepad.rs b/crates/horizon-client-input/src/gamepad.rs
+index 8a67b9d..4fb51ef 100644
+--- a/crates/horizon-client-input/src/gamepad.rs
++++ b/crates/horizon-client-input/src/gamepad.rs
+@@ -1159,13 +1159,37 @@ pub fn bow_power(ticks: u32) -> f32 {
+     ((f * f + f * 2.0) / 3.0).min(1.0)
+ }
+ 
+-/// `SDL_GAMECONTROLLERCONFIG` with a mapping file's rows in it, or `None` when the file has none. The
++/// SDL's GUID of an input device from its bus type, vendor, product and version: each one as two
++/// little-endian bytes and two zero bytes, in hex.
++pub fn sdl_guid(ids: [u16; 4]) -> String {
++    ids.iter()
++        .map(|id| {
++            let [low, high] = id.to_le_bytes();
++            format!("{low:02x}{high:02x}0000")
++        })
++        .collect()
++}
++
++/// `SDL_GAMECONTROLLERCONFIG` with a mapping file's rows for these pads (SDL GUIDs) in it, or `None`
++/// when it has none of theirs. Only those: the file can be the whole SDL database (600 KB on muOS),
++/// and one environment string over 128 KiB makes every program this one starts fail with E2BIG. The
+ /// last row for a pad wins, so the variable's own rows stay ahead of the file's, as in SDL.
+-pub fn sdl_config_with_file(file_rows: &str, config: Option<&str>) -> Option<String> {
+-    if file_rows.trim().is_empty() {
++pub fn sdl_config_with_file(
++    file_rows: &str,
++    pads: &[String],
++    config: Option<&str>,
++) -> Option<String> {
++    let rows: Vec<&str> = file_rows
++        .lines()
++        .filter(|row| {
++            let guid = row.split(',').next().unwrap_or("").trim();
++            pads.iter().any(|pad| pad.eq_ignore_ascii_case(guid))
++        })
++        .collect();
++    if rows.is_empty() {
+         return None;
+     }
+-    Some(format!("{file_rows}\n{}", config.unwrap_or("")))
++    Some(format!("{}\n{}", rows.join("\n"), config.unwrap_or("")))
+ }
+ 
+ #[cfg(test)]
+@@ -1174,10 +1198,36 @@ mod tests {
+ 
+     #[test]
+     fn a_mapping_file_comes_before_the_variables_rows() {
+-        assert_eq!(sdl_config_with_file("", None), None);
+-        assert_eq!(sdl_config_with_file(" \n", Some("row")), None);
+-        assert_eq!(sdl_config_with_file("file", None).as_deref(), Some("file\n"));
+-        assert_eq!(sdl_config_with_file("file", Some("own")).as_deref(), Some("file\nown"));
++        let pads = ["aa".to_owned()];
++        assert_eq!(sdl_config_with_file("", &pads, None), None);
++        assert_eq!(sdl_config_with_file(" \n", &pads, Some("row")), None);
++        assert_eq!(
++            sdl_config_with_file("aa,pad", &pads, None).as_deref(),
++            Some("aa,pad\n")
++        );
++        assert_eq!(
++            sdl_config_with_file("aa,pad", &pads, Some("own")).as_deref(),
++            Some("aa,pad\nown")
++        );
++    }
++
++    #[test]
++    fn a_whole_database_gives_only_the_rows_of_the_pads_there_are() {
++        let pads = [sdl_guid([0x19, 0x484b, 0x1100, 0x100])];
++        assert_eq!(pads[0], "190000004b4800000011000000010000");
++        let other = format!("{},Other,a:b0,platform:Linux,\n", "00".repeat(16));
++        let row = format!("{},GO-Super Gamepad,a:b1,platform:Linux,", pads[0]);
++        let file = format!(
++            "# a comment\n{}{row}\n{}",
++            other.repeat(3000),
++            other.repeat(3000)
++        );
++        assert!(file.len() > 128 * 1024);
++        assert_eq!(
++            sdl_config_with_file(&file, &pads, None),
++            Some(format!("{row}\n"))
++        );
++        assert_eq!(sdl_config_with_file(&other, &pads, None), None);
+     }
+ 
+     #[test]
+diff --git a/crates/horizon-client/src/main.rs b/crates/horizon-client/src/main.rs
+index 4604ff3..9c86c90 100644
+--- a/crates/horizon-client/src/main.rs
++++ b/crates/horizon-client/src/main.rs
+@@ -14,7 +14,7 @@ static MOD_API_LEVEL: [u8; 27] = horizon_mods::api_level::MARK;
+ 
+ /// SDL games get this machine's pad layout from `SDL_GAMECONTROLLERCONFIG_FILE`. gilrs doesn't read
+ /// that file, and only `SDL_GAMECONTROLLERCONFIG` wins over the SDL database it bundles, so the file's
+-/// rows go in that variable. Before any thread starts.
++/// rows for the pads this machine has go in that variable. Before any thread starts.
+ fn adopt_sdl_mapping_file() {
+     let Some(file) = std::env::var_os("SDL_GAMECONTROLLERCONFIG_FILE") else {
+         return;
+@@ -23,11 +23,36 @@ fn adopt_sdl_mapping_file() {
+         return;
+     };
+     let config = std::env::var("SDL_GAMECONTROLLERCONFIG").ok();
+-    if let Some(config) = horizon_client::gamepad::sdl_config_with_file(&rows, config.as_deref()) {
++    let pads = input_device_guids();
++    if let Some(config) =
++        horizon_client::gamepad::sdl_config_with_file(&rows, &pads, config.as_deref())
++    {
+         horizon_threads::set_env_before_threads("SDL_GAMECONTROLLERCONFIG", &config);
+     }
+ }
+ 
++/// SDL's GUID of each input device the kernel has now.
++fn input_device_guids() -> Vec<String> {
++    let Ok(devices) = std::fs::read_dir("/sys/class/input") else {
++        return Vec::new();
++    };
++    devices
++        .flatten()
++        .filter_map(|device| {
++            let id = |name: &str| {
++                let path = device.path().join("id").join(name);
++                u16::from_str_radix(std::fs::read_to_string(path).ok()?.trim(), 16).ok()
++            };
++            Some(horizon_client::gamepad::sdl_guid([
++                id("bustype")?,
++                id("vendor")?,
++                id("product")?,
++                id("version")?,
++            ]))
++        })
++        .collect()
++}
++
+ fn main() {
+     horizon_threads::configure_allocator();
+     adopt_sdl_mapping_file();
+-- 
+2.43.0
+

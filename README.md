@@ -13,7 +13,7 @@ Vulkan work for the same devices is in progress and isn't in this repository yet
 
 | Path | What it is |
 |---|---|
-| `patches/` | The series, applied in order to Horizon `26747867d` (see [Building](#building)): 0001, then 0029–0037 and 0041–0055. 0038–0040 are the Vulkan work and aren't here |
+| `patches/` | The series, applied in order to Horizon `26747867d` (see [Building](#building)): 0001, then 0029–0037 and 0041–0056. 0038–0040 are the Vulkan work and aren't here |
 | `FINDINGS.md` | The measurements behind 0029–0037 |
 | `spikes/` | Experiments that didn't make the series |
 | `LICENSE`, `LICENSE.horizon.txt` | This repository's license, and Horizon's |
@@ -128,6 +128,7 @@ it gives exactly the tree the port was built from.
 | 0053 | Abandoned proto chunks saved in small batches | Up to 16 MiB of NBT at once before |
 | 0054 | Block states share equal property maps | Heap at rest 292 → 271 MB |
 | 0055 | A, B, X and Y follow PortMaster's mapping file, so they act as labeled | |
+| 0056 | Only the mapping rows of the pads that are connected are kept. On muOS the file is the whole SDL database (about 595 KB); with all of it in one environment variable, every program the game started failed, the texture bake first | Unit-tested only |
 
 Each memory patch reads the machine's RAM rather than a device name, so a machine with plenty behaves as before, except
 0054, which applies everywhere. Each patch's own message has its hypothesis, numbers and how to falsify it.
@@ -164,7 +165,8 @@ level, calculated rather than measured), and `workers:1` in `horizon-graphics.tx
 ## Not tested
 
 A release build of the whole series, long play by hand, survival over time, a real ocean, whether re-decoding sounds
-(0044) causes hitches, and the buttons on the real pad (0055 was tested with a virtual copy of it).
+(0044) causes hitches, the buttons on the real pad (0055 was tested with a virtual copy of it), and 0056 on any
+handheld.
 
 ## License
 
